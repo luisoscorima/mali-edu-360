@@ -28,4 +28,11 @@ export class Meeting {
 
   @Column({ type: 'varchar' })
   status: 'scheduled' | 'live' | 'finished';
+
+  // Estas dos son nuevas, y las hacemos opcionales (nullable)
+  @Column({ type: 'varchar', nullable: true })
+  joinUrl?: string;
+
+  @Column({ type: 'varchar', nullable: true })
+  startUrl?: string;
 }

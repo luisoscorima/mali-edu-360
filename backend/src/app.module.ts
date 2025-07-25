@@ -2,6 +2,10 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { MeetingsModule } from './meetings/meetings.module';
+import { ZoomLicensesModule } from './zoom-licenses/zoom-licenses.module';
+import { RecordingsModule } from './recordings/recordings.module';
+import { DriveModule } from './drive/drive.module';
+import { MoodleModule } from './moodle/moodle.module';
 
 @Module({
   imports: [
@@ -31,6 +35,10 @@ import { MeetingsModule } from './meetings/meetings.module';
       },
     }),
     MeetingsModule,
+    ZoomLicensesModule,
+    RecordingsModule,
+    DriveModule,
+    MoodleModule,
   ],
 })
 export class AppModule { }
