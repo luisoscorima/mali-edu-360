@@ -6,7 +6,7 @@ import * as https from 'https';
 import * as http from 'http';
 import { createHash } from 'crypto';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, DeepPartial } from 'typeorm';
 import { DriveService } from '../drive/drive.service';
 import { MoodleService } from '../moodle/moodle.service';
 import { Recording } from './entities/recording.entity';
@@ -64,14 +64,27 @@ export class RecordingsService {
     }
     if (zoomMeetingId) this.inFlightMeetings.add(zoomMeetingId);
 
-    // Map Zoom meeting to our Meeting entity
-  const meeting = await this.meetingRepo.findOne({ where: { zoomMeetingId } });
+    // Map Zoom meeting to our Meeting entity; if missing (e.g., created via Moodle LTI), try to infer by topic and create it
+  let meeting: Meeting | null = await this.meetingRepo.findOne({ where: { zoomMeetingId } });
     if (!meeting) {
-      this.logger.warn(`No se encontró Meeting para zoomMeetingId=${zoomMeetingId}`);
-      if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
-      return { status: 'ignored' };
+      this.logger.warn(`No se encontró Meeting para zoomMeetingId=${zoomMeetingId}. Intentando mapear por topic a curso Moodle (LTI)…`);
+      try {
+        const inferred = await this.resolveExternalMeetingFromTopic(zoomMeetingId, topic);
+        if (!inferred) {
+          this.logger.warn(`No se pudo inferir curso desde topic="${topic}". Evento ignorado.`);
+          if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
+          return { status: 'ignored' };
+        }
+  meeting = inferred;
+  this.logger.log(`Meeting creado por LTI: id=${meeting!.id}, courseIdMoodle=${meeting!.courseIdMoodle}`);
+      } catch (e: any) {
+        this.logger.warn(`Fallo al crear Meeting desde topic: ${e?.message || e}`);
+        if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
+        return { status: 'ignored' };
+      }
+    } else {
+      this.logger.log(`Meeting encontrado: id=${meeting.id}, courseIdMoodle=${meeting.courseIdMoodle}`);
     }
-  this.logger.log(`Meeting encontrado: id=${meeting.id}, courseIdMoodle=${meeting.courseIdMoodle}`);
 
     // Process the first MP4 recording file
     const mp4 = files.find((f) => f.file_type === 'MP4' && f.download_url);
@@ -88,17 +101,17 @@ export class RecordingsService {
     const existing = await this.recRepo.findOne({ where: { zoomRecordingId } });
     if (existing) {
       this.logger.log(`Idempotente: recording ya procesada (DB) zoomRecordingId=${zoomRecordingId}.`);
-      await this.meetingRepo.update(meeting.id, { status: 'completed' as any });
-      await this.zoomLicenses.releaseLicense(meeting.id);
+      await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
+      await this.zoomLicenses.releaseLicense(meeting!.id);
       return { status: 'done', driveUrl: existing.driveUrl };
     }
     const existingDrive = await this.driveService.findFileByZoomRecordingId(zoomRecordingId);
     if (existingDrive) {
       this.logger.log(`Idempotente: archivo ya en Drive por zoomRecordingId=${zoomRecordingId}. Creando registro en DB y cerrando flujo.`);
-      const rec = this.recRepo.create({ meetingId: meeting.id, zoomRecordingId, driveUrl: existingDrive.webViewLink });
+      const rec = this.recRepo.create({ meetingId: meeting!.id, zoomRecordingId, driveUrl: existingDrive.webViewLink });
       await this.recRepo.save(rec);
-      await this.meetingRepo.update(meeting.id, { status: 'completed' as any });
-      await this.zoomLicenses.releaseLicense(meeting.id);
+      await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
+      await this.zoomLicenses.releaseLicense(meeting!.id);
   return { status: 'done', driveUrl: existingDrive.webViewLink };
     }
 
@@ -128,7 +141,7 @@ export class RecordingsService {
     this.logger.log(`Descarga completa (${finalDownloadSize} bytes) en ${Math.round(dlMs / 1000)}s.`);
 
     // 2) Upload to Drive into course folder + yyyy-mm
-  const courseFolderCode = String(meeting.courseIdMoodle);
+  const courseFolderCode = String(meeting!.courseIdMoodle);
   const rootDrive = process.env.GDRIVE_SHARED_DRIVE_ID ?? '';
   const courseFolderId = await this.driveService.ensureFolder(courseFolderCode, rootDrive);
   this.logger.log(`Carpeta curso en Drive: ${courseFolderCode} -> ${courseFolderId}`);
@@ -136,8 +149,8 @@ export class RecordingsService {
     const upStartedAt = Date.now();
     const upload = await this.withRobustRetries('upload', async (attempt) => {
       const res = await this.driveService.uploadFile(localPath, filename, monthFolderId, {
-        meetingId: meeting.id,
-        courseIdMoodle: meeting.courseIdMoodle!,
+        meetingId: meeting!.id,
+        courseIdMoodle: meeting!.courseIdMoodle!,
         zoomRecordingId,
         timeoutMs: this.DRIVE_UPLOAD_TIMEOUT_MS,
       });
@@ -153,8 +166,8 @@ export class RecordingsService {
     const upMs = Date.now() - upStartedAt;
     this.logger.log(`Archivo subido a Drive: ${driveLink} | md5=${upload.md5Checksum || upload.localMd5} | ${Math.round(upMs / 1000)}s`);
 
-  const forumId = await this.moodleService.getRecordedForumId(meeting.courseIdMoodle!);
-  this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting.courseIdMoodle}`);
+  const forumId = await this.moodleService.getRecordedForumId(meeting!.courseIdMoodle!);
+  this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting!.courseIdMoodle}`);
     const previewLink = driveLink.replace('/view', '/preview');
     const iframe = `<iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>`;
     const subject = `${topic || 'Clase grabada'} [${zoomRecordingId}]`;
@@ -164,15 +177,15 @@ export class RecordingsService {
 
     // 4) Persist Recording
     const rec = this.recRepo.create({
-      meetingId: meeting.id,
+  meetingId: meeting!.id,
       zoomRecordingId,
       driveUrl: driveLink,
     });
     await this.recRepo.save(rec);
 
     // 5) Update meeting and release license
-  await this.meetingRepo.update(meeting.id, { status: 'completed' as any });
-    await this.zoomLicenses.releaseLicense(meeting.id);
+  await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
+    await this.zoomLicenses.releaseLicense(meeting!.id);
 
     // 6) Cleanup local file
     try { fs.unlinkSync(localPath); } catch {}
@@ -183,6 +196,96 @@ export class RecordingsService {
     } finally {
       if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
     }
+  }
+
+  /**
+   * For Zoom meetings created via Moodle LTI (not present in DB), infer the Moodle course from the Zoom topic
+   * by trying fullname and shortname, and create a minimal Meeting entry to attach the recording.
+   */
+  private async resolveExternalMeetingFromTopic(
+    zoomMeetingId: string,
+    topic?: string,
+  ): Promise<Meeting | null> {
+    if (!topic) return null;
+    let courseId: number | null = null;
+
+    const tryResolve = async (candidate: string): Promise<number | null> => {
+      // 0) exact fullname/displayname via search
+      try {
+        const exact = await this.moodleService.findCourseIdByFullnameExact(candidate);
+        if (exact) return exact;
+      } catch {}
+      // 1) fullname
+      try {
+        const id = await this.moodleService.findCourseIdByField('fullname', candidate);
+        return id;
+      } catch {}
+      // 2) shortname
+      try {
+        const id = await this.moodleService.findCourseIdByField('shortname', candidate);
+        return id;
+      } catch {}
+      // 3) search (first result)
+      try {
+        const id = await this.moodleService.searchCourseIdByName(candidate);
+        if (id) return id;
+      } catch {}
+      return null;
+    };
+
+    // Primary attempts with original topic
+    courseId = await tryResolve(topic);
+
+    // Build normalized candidates if needed
+    if (!courseId) {
+      const candidates: string[] = [];
+      const trimmed = topic.trim();
+      const noParens = trimmed.replace(/\s*[\(\[].*?[\)\]]\s*$/g, '').trim();
+      if (noParens && noParens !== trimmed) candidates.push(noParens);
+      const splitDash = trimmed.split(/\s*[-–—:\|]\s*/)[0]?.trim();
+      if (splitDash && splitDash.length >= 3 && splitDash !== trimmed) candidates.push(splitDash);
+      const rmSuffixUpper2 = trimmed.replace(/\s+[A-Z]{1,3}$/,'').trim(); // e.g., "EP"
+      if (rmSuffixUpper2 && rmSuffixUpper2.length >= 3 && rmSuffixUpper2 !== trimmed) candidates.push(rmSuffixUpper2);
+
+      for (const cand of candidates) {
+        this.logger.log(`Intentando resolver curso por variante: "${cand}"`);
+        courseId = await tryResolve(cand);
+        if (courseId) break;
+      }
+    }
+
+    // Progressive truncation (remove last word) up to 3 attempts
+    if (!courseId) {
+      const words = topic.split(/\s+/).filter(Boolean);
+      for (let cut = 1; cut <= 3 && words.length - cut >= 2; cut++) {
+        const cand = words.slice(0, words.length - cut).join(' ');
+        this.logger.log(`Intentando resolver curso por truncación: "${cand}"`);
+        courseId = await tryResolve(cand);
+        if (courseId) break;
+      }
+    }
+
+    if (!courseId) {
+      const defCourse = Number(process.env.DEFAULT_COURSE_ID_MOODLE);
+      if (Number.isFinite(defCourse) && defCourse > 0) {
+        this.logger.warn(`Curso no encontrado para topic="${topic}". Usando DEFAULT_COURSE_ID_MOODLE=${defCourse}.`);
+        courseId = defCourse;
+      } else {
+        this.logger.warn(`Curso no encontrado por topic="${topic}" tras variantes y truncaciones, y sin DEFAULT_COURSE_ID_MOODLE`);
+        return null;
+      }
+    }
+
+    const entity = this.meetingRepo.create({
+      topic: topic,
+      courseIdMoodle: courseId!,
+      zoomMeetingId: String(zoomMeetingId),
+      zoomLicenseId: null as any,
+      startTime: new Date(),
+      status: 'scheduled',
+    } as DeepPartial<Meeting>);
+  const saved = (await this.meetingRepo.save(entity)) as Meeting;
+    return saved;
   }
 
   private async withRetries<T>(fn: () => Promise<T>, attempts = 3, backoffMs = 1000): Promise<T> {
