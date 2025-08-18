@@ -43,6 +43,11 @@ export class ZoomService {
     return this.accessToken;
   }
 
+  // Exponer token para integraciones internas (descarga de grabaciones)
+  async getAccessToken(): Promise<string> {
+    return this.generateAccessToken();
+  }
+
   async createMeeting(hostEmail: string, topic: string, startTime: string): Promise<any> {
     const token = await this.generateAccessToken();
 

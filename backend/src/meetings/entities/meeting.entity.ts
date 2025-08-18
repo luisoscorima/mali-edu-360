@@ -8,28 +8,24 @@ export class Meeting {
   @Column()
   topic: string;
 
-  @Column()
-  courseId: string;
+  // Moodle numeric course id
+  @Column({ type: 'int', nullable: true })
+  courseIdMoodle: number;
 
-  @Column()
-  userId: string;
-
+  // Zoom meeting id (string/number from Zoom)
   @Column()
   zoomMeetingId: string;
 
-  @Column()
-  licenseId: string;
+  // FK to ZoomLicense (nullable for existing historical rows)
+  @Column({ type: 'uuid', nullable: true })
+  zoomLicenseId: string;
 
   @Column({ type: 'timestamp' })
   startTime: Date;
 
-  @Column({ type: 'timestamp' })
-  endTime: Date;
+  @Column({ type: 'varchar', default: 'scheduled' })
+  status: 'scheduled' | 'completed';
 
-  @Column({ type: 'varchar' })
-  status: 'scheduled' | 'live' | 'finished';
-
-  // Estas dos son nuevas, y las hacemos opcionales (nullable)
   @Column({ type: 'varchar', nullable: true })
   joinUrl?: string;
 

@@ -25,13 +25,12 @@ export class MeetingsService {
   }
 
   async create(data: Partial<Meeting>): Promise<Meeting> {
-    const { topic, userId, courseId, startTime: rawStart } = data;
-    if (!rawStart || !userId || !topic || !courseId) {
-      throw new Error('startTime, userId, topic y courseId son requeridos');
+    const { topic, courseIdMoodle, startTime: rawStart } = data as any;
+    if (!rawStart || !topic || typeof courseIdMoodle !== 'number') {
+      throw new Error('startTime, topic y courseIdMoodle son requeridos');
     }
 
-    const startTime = new Date(rawStart);
-    const endTime = new Date(startTime.getTime() + 60 * 60 * 1000);
+    const startTime = new Date(rawStart as any);
 
     // 1. Obtener licencia disponible
     const license = await this.zoomLicensesService.getAvailableLicense();
@@ -46,14 +45,11 @@ export class MeetingsService {
     // 3. Preparar la entidad
     const toSave = this.meetingRepo.create({
       topic,
-      userId,
-      courseId,
+      courseIdMoodle,
       zoomMeetingId: String(zoomData.id),
-      licenseId: license.id,
+      zoomLicenseId: license.id,
       startTime,
-      endTime,
       status: 'scheduled',
-      // Si añadiste estas columnas en tu entidad:
       startUrl: zoomData.start_url,
       joinUrl: zoomData.join_url,
     } as Meeting);
@@ -75,7 +71,7 @@ export class MeetingsService {
   async remove(id: string): Promise<Meeting> {
     const meeting = await this.findOne(id);
     await this.meetingRepo.remove(meeting);
-    await this.zoomLicensesService.releaseLicense(meeting.licenseId);
+    await this.zoomLicensesService.releaseLicense(meeting.id);
     return meeting;
   }
 }

@@ -1,8 +1,22 @@
+import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn } from 'typeorm';
+
+@Entity('recordings')
 export class Recording {
-  id: string; // UUID as string
-  meetingId: string; // UUID as string
-  fileUrl: string;
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  // FK logical reference to our internal Meeting (uuid)
+  @Column({ type: 'uuid' })
+  meetingId: string;
+
+  // Zoom recording file id
+  @Column({ type: 'varchar' })
+  zoomRecordingId: string;
+
+  // Public/private Drive URL where the video is stored
+  @Column({ type: 'varchar' })
   driveUrl: string;
-  uploaded: boolean;
+
+  @CreateDateColumn({ type: 'timestamp with time zone' })
   createdAt: Date;
 }

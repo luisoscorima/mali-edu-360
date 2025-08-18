@@ -1,6 +1,6 @@
 import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
 
-@Entity('zoom_licenses')
+@Entity('zoom_license')
 export class ZoomLicense {
   @PrimaryGeneratedColumn('uuid')
   id: string;

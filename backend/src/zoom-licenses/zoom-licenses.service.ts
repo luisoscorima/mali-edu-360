@@ -26,7 +26,7 @@ export class ZoomLicensesService {
   async releaseLicense(meetingId: string) {
     await this.licenseRepo.update(
       { currentMeetingId: meetingId },
-      { status: 'available', currentMeetingId: null as any },
+  { status: 'available', currentMeetingId: null as any },
     );
   }
 }
