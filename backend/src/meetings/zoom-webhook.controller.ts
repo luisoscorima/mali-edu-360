@@ -19,16 +19,44 @@ export class ZoomWebhookController {
     @Headers('x-zm-signature') signature: string,
     @Body() body: any,
   ) {
-    // 1) Validate signature
-  const secret = process.env.ZOOM_WEBHOOK_SECRET || '';
-  const bypass = (process.env.ZOOM_WEBHOOK_DISABLE_SIGNATURE || '').toLowerCase() === 'true';
+    const secret = process.env.ZOOM_WEBHOOK_SECRET || '';
+    const bypass = (process.env.ZOOM_WEBHOOK_DISABLE_SIGNATURE || '').toLowerCase() === 'true';
+
+    // Normalize body when body-parser.raw is used (Buffer) to still access event/payload
+    let eventBody: any = body;
+    if (Buffer.isBuffer(body)) {
+      try { eventBody = JSON.parse(body.toString('utf8')); } catch { eventBody = {}; }
+    }
+
+    // 1) Event routing (handle URL validation first)
+    const event = eventBody?.event as string;
+    this.logger.log(`Zoom event received: ${event}`);
+
+    if (event === 'endpoint.url_validation') {
+      if (!secret) {
+        this.logger.warn('URL validation requested but ZOOM_WEBHOOK_SECRET is not set');
+        return { status: 'ignored' };
+      }
+      // Zoom handshake: echo plainToken and return encryptedToken = HMAC_SHA256(secret, plainToken)
+      const plainToken: string | undefined = eventBody?.payload?.plainToken;
+      if (!plainToken) {
+        this.logger.warn('URL validation without plainToken');
+        return { status: 'ignored' };
+      }
+  // Per Zoom docs, encryptedToken must be HMAC-SHA256(plainToken, secret) HEX-encoded
+  const encryptedToken = createHmac('sha256', secret).update(plainToken).digest('hex');
+      return { plainToken, encryptedToken } as any;
+    }
+
+    // 2) Validate signature for real events
     if (!secret) {
       // If not configured, reject silently to avoid abuse
       return { status: 'ignored' };
     }
 
     if (!bypass) {
-      const message = `v0:${timestamp}:${(req as any).rawBody?.toString() ?? JSON.stringify(body)}`;
+  const raw = (req as any).rawBody?.toString() ?? (Buffer.isBuffer(body) ? body.toString('utf8') : JSON.stringify(eventBody));
+      const message = `v0:${timestamp}:${raw}`;
       const hash = createHmac('sha256', secret).update(message).digest('hex');
       const expected = `v0=${hash}`;
 
@@ -50,11 +78,9 @@ export class ZoomWebhookController {
       this.logger.warn('Zoom webhook signature validation BYPASSED for testing');
     }
 
-    // 2) Event routing
-    const event = body?.event as string;
-  this.logger.log(`Zoom event received: ${event}`);
-  if (event === 'recording.completed') {
-      await this.recordingsService.processRecordingCompleted(body);
+    // 3) Process events
+    if (event === 'recording.completed') {
+      await this.recordingsService.processRecordingCompleted(eventBody);
       return { status: 'ok' };
     }
 
