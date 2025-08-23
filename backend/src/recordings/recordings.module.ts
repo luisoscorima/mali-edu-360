@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { ConfigModule } from '@nestjs/config';
 import { RecordingsService } from './recordings.service';
 import { DriveModule } from '../drive/drive.module';
 import { MoodleModule } from '../moodle/moodle.module';
@@ -9,7 +10,13 @@ import { ZoomLicensesModule } from 'src/zoom-licenses/zoom-licenses.module';
 import { ZoomService } from 'src/meetings/zoom.service';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Recording, Meeting]), DriveModule, MoodleModule, ZoomLicensesModule],
+  imports: [
+    TypeOrmModule.forFeature([Recording, Meeting]), 
+    DriveModule, 
+    MoodleModule, 
+    ZoomLicensesModule,
+    ConfigModule,
+  ],
   providers: [RecordingsService, ZoomService],
   exports: [RecordingsService],
 })

@@ -47,11 +47,30 @@ export class MoodleService {
     return courses[0].id as number;
   }
 
-  /** 
-   * Obtiene la lista de módulos de la sección 0 del curso 
-   * y extrae el forumid del foro “Clases Grabadas”. 
+  /**
+   * Busca el foro destinado a grabaciones en todo el curso.
+   * Prioridad:
+   * 1) Foro con nombre "Clases Grabadas"
+   * 2) Foro con nombre "Anuncios" o "Announcements"
+   * 3) Primer módulo de tipo forum encontrado en cualquier sección
    */
   async getRecordedForumId(courseId: number): Promise<number> {
+    // 0) API específica de foros (más confiable para obtener IDs)
+    const forums = await this.listForumsByCourse(courseId);
+    if (forums.length > 0) {
+      const exact = forums.find((f) => String(f.name || '').trim().toLowerCase() === 'clases grabadas');
+      if (exact?.id) return exact.id;
+
+      const anuncios = forums.find((f) => {
+        const n = String(f.name || '').trim().toLowerCase();
+        return n === 'anuncios' || n === 'announcements' || n === 'news forum';
+      });
+      if (anuncios?.id) return anuncios.id;
+
+      return forums[0].id;
+    }
+
+    // 1) Fallback: inspeccionar contenidos del curso y tomar instance de módulos forum
     const params = new URLSearchParams();
     params.append('wstoken', this.token);
     params.append('moodlewsrestformat', 'json');
@@ -59,16 +78,54 @@ export class MoodleService {
     params.append('courseid', courseId.toString());
 
     const resp = await axios.post(`${this.baseUrl}/webservice/rest/server.php`, params);
-    const section0 = resp.data[0];
-    const forumModule: CourseContentModule = section0.modules.find(
-      (m: CourseContentModule) =>
-        m.modname === 'forum' && m.name === 'Clases Grabadas',
-    );
+    const sections = Array.isArray(resp.data) ? resp.data : [];
+    const allModules: CourseContentModule[] = sections
+      .flatMap((s: any) => Array.isArray(s.modules) ? s.modules : [])
+      .filter((m: any) => m && m.modname === 'forum');
 
-    if (!forumModule) {
-      throw new Error(`No existe foro "Clases Grabadas" en el curso ${courseId}`);
+    const exactM = allModules.find((m) => m.name?.trim().toLowerCase() === 'clases grabadas');
+    if (exactM?.instance) return exactM.instance;
+    const anunciosM = allModules.find((m) => {
+      const n = String(m.name || '').trim().toLowerCase();
+      return n === 'anuncios' || n === 'announcements' || n === 'news forum';
+    });
+    if (anunciosM?.instance) return anunciosM.instance;
+    if (allModules[0]?.instance) return allModules[0].instance;
+
+    throw new Error(`No se encontró ningún foro en el curso ${courseId}`);
+  }
+
+  /** Lista los foros del curso usando mod_forum_get_forums_by_courses */
+  private async listForumsByCourse(courseId: number): Promise<Array<{ id: number; name: string; course: number }>> {
+    try {
+      const params = new URLSearchParams();
+      params.append('wstoken', this.token);
+      params.append('moodlewsrestformat', 'json');
+      params.append('wsfunction', 'mod_forum_get_forums_by_courses');
+      params.append('courseids[0]', courseId.toString());
+      const resp = await axios.post(`${this.baseUrl}/webservice/rest/server.php`, params);
+      const forums = Array.isArray(resp.data) ? resp.data : (Array.isArray(resp.data?.forums) ? resp.data.forums : []);
+      return (forums as any[]).map((f) => ({ id: Number(f.id), name: String(f.name || ''), course: Number(f.course) }));
+    } catch (e) {
+      this.logger.warn(`listForumsByCourse fallo para courseId=${courseId}: ${String((e as any)?.message || e)}`);
+      return [];
     }
-    return forumModule.instance;
+  }
+
+  // Public wrapper for debugging/administration
+  async getForumsByCourse(courseId: number): Promise<Array<{ id: number; name: string; course: number }>> {
+    return this.listForumsByCourse(courseId);
+  }
+
+  /** Get full course contents (sections + modules) for debugging */
+  async getCourseContents(courseId: number): Promise<any[]> {
+    const params = new URLSearchParams();
+    params.append('wstoken', this.token);
+    params.append('moodlewsrestformat', 'json');
+    params.append('wsfunction', 'core_course_get_contents');
+    params.append('courseid', String(courseId));
+    const resp = await axios.post(`${this.baseUrl}/webservice/rest/server.php`, params);
+    return Array.isArray(resp.data) ? resp.data : [];
   }
 
   /**

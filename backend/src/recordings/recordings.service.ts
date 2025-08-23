@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import axios, { AxiosResponse } from 'axios';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -14,11 +15,44 @@ import { ZoomLicensesService } from '../zoom-licenses/zoom-licenses.service';
 import { Meeting } from '../meetings/entities/meeting.entity';
 import { ZoomService } from '../meetings/zoom.service';
 
+export interface RetryResult {
+  selector: Record<string, any>;
+  mode: 'full' | 'republish' | 'skipped';
+  status: 'ok' | 'failed' | 'skipped';
+  reason: string;
+  meetingId?: string;
+  zoomMeetingId?: string;
+  courseIdMoodle?: number;
+  driveUrl?: string;
+  moodlePostId?: number;
+  integrity?: {
+    localMd5?: string;
+    driveMd5?: string;
+    sizeBytes?: number;
+  };
+}
+
+export interface RetryRequestDTO {
+  zoomRecordingId?: string;
+  meetingId?: string;
+  zoomMeetingId?: string;
+  from?: string;
+  to?: string;
+  republish?: boolean;
+  forceRedownload?: boolean;
+  forceRepost?: boolean;
+  overrideCourseIdMoodle?: number;
+  dryRun?: boolean;
+  limit?: number;
+}
+
 @Injectable()
 export class RecordingsService {
   private readonly logger = new Logger(RecordingsService.name);
   // Simple in-memory lock to avoid concurrent processing for the same meeting
   private readonly inFlightMeetings = new Set<string>();
+  // Manual retry concurrency guard
+  private readonly retryGuard = new Map<string, Promise<any>>();
 
   // Config defaults (overridable via env)
   private readonly MAX_RETRIES_DOWNLOAD = this.getIntEnv('MAX_RETRIES_DOWNLOAD', 10);
@@ -38,6 +72,7 @@ export class RecordingsService {
     private readonly moodleService: MoodleService,
     private readonly zoomLicenses: ZoomLicensesService,
     private readonly zoomService: ZoomService,
+    private readonly configService: ConfigService,
   ) {}
 
   /**
@@ -168,8 +203,8 @@ export class RecordingsService {
 
   const forumId = await this.moodleService.getRecordedForumId(meeting!.courseIdMoodle!);
   this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting!.courseIdMoodle}`);
-    const previewLink = driveLink.replace('/view', '/preview');
-    const iframe = `<iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>`;
+  const previewLink = driveLink.replace('/view', '/preview');
+  const iframe = `<p><iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe></p>`;
     const subject = `${topic || 'Clase grabada'} [${zoomRecordingId}]`;
     await this.withRobustRetries('upload', async () => {
       await this.moodleService.addForumDiscussion(forumId, subject, iframe);
@@ -286,6 +321,483 @@ export class RecordingsService {
     } as DeepPartial<Meeting>);
   const saved = (await this.meetingRepo.save(entity)) as Meeting;
     return saved;
+  }
+
+  /**
+   * Manual retry system for failed or missed recordings
+   */
+  async manualRetry(dto: RetryRequestDTO): Promise<RetryResult[]> {
+    this.logger.log(`retry:start - selector=${JSON.stringify(this.extractSelector(dto))}`);
+    
+    const limit = dto.limit ?? 5;
+    const results: RetryResult[] = [];
+
+    try {
+      // Resolve target recordings
+      const targets = await this.resolveRetryTargets(dto, limit);
+      this.logger.log(`retry:resolve - found ${targets.length} target(s)`);
+
+      // Process each target
+      for (const target of targets) {
+        const guardKey = target.zoomRecordingId || target.meetingId || 'unknown';
+        
+        // Check if already being processed
+        if (this.retryGuard.has(guardKey)) {
+          results.push({
+            selector: this.extractSelector(dto),
+            mode: 'skipped',
+            status: 'skipped',
+            reason: 'already-in-progress',
+            ...target,
+          });
+          continue;
+        }
+
+        // Process with guard
+        const promise = this.processRetryTarget(target, dto);
+        this.retryGuard.set(guardKey, promise);
+
+        try {
+          const result = await promise;
+          results.push(result);
+        } finally {
+          this.retryGuard.delete(guardKey);
+        }
+      }
+
+      return results;
+    } catch (error) {
+      this.logger.error(`retry:fail - ${error.message}`, error.stack);
+      throw error;
+    }
+  }
+
+  private extractSelector(dto: RetryRequestDTO): Record<string, any> {
+    if (dto.zoomRecordingId) return { zoomRecordingId: dto.zoomRecordingId };
+    if (dto.meetingId) return { meetingId: dto.meetingId };
+    if (dto.zoomMeetingId) return { zoomMeetingId: dto.zoomMeetingId };
+    if (dto.from && dto.to) return { from: dto.from, to: dto.to };
+    return {};
+  }
+
+  private async resolveRetryTargets(dto: RetryRequestDTO, limit: number): Promise<Array<{
+    zoomRecordingId?: string;
+    meetingId?: string;
+    zoomMeetingId?: string;
+    courseIdMoodle?: number;
+    topic?: string;
+    recording?: Recording;
+    meeting?: Meeting;
+  }>> {
+    const targets: any[] = [];
+
+    if (dto.zoomRecordingId) {
+      // Single recording by zoomRecordingId
+      const recording = await this.recRepo.findOne({
+        where: { zoomRecordingId: dto.zoomRecordingId },
+        relations: ['meeting'], // if you have relations set up
+      });
+      
+      let meeting: Meeting | undefined;
+      if (recording?.meetingId) {
+        meeting = await this.meetingRepo.findOne({ where: { id: recording.meetingId } }) || undefined;
+      }
+
+      targets.push({
+        zoomRecordingId: dto.zoomRecordingId,
+        recording,
+        meeting,
+        meetingId: meeting?.id,
+        zoomMeetingId: meeting?.zoomMeetingId,
+        courseIdMoodle: meeting?.courseIdMoodle,
+        topic: meeting?.topic,
+      });
+    }
+
+    if (dto.meetingId) {
+      // Single meeting by internal meetingId
+      const meeting = await this.meetingRepo.findOne({ where: { id: dto.meetingId } });
+      if (meeting) {
+        const recordings = await this.recRepo.find({ where: { meetingId: dto.meetingId } });
+        if (recordings.length > 0) {
+          for (const recording of recordings) {
+            targets.push({
+              zoomRecordingId: recording.zoomRecordingId,
+              recording,
+              meeting,
+              meetingId: meeting.id,
+              zoomMeetingId: meeting.zoomMeetingId,
+              courseIdMoodle: meeting.courseIdMoodle,
+              topic: meeting.topic,
+            });
+          }
+        } else {
+          // No recordings yet, might need to fetch from Zoom
+          targets.push({
+            meeting,
+            meetingId: meeting.id,
+            zoomMeetingId: meeting.zoomMeetingId,
+            courseIdMoodle: meeting.courseIdMoodle,
+            topic: meeting.topic,
+          });
+        }
+      }
+    }
+
+    if (dto.zoomMeetingId) {
+      // Single meeting by zoomMeetingId
+      const meeting = await this.meetingRepo.findOne({ where: { zoomMeetingId: dto.zoomMeetingId } });
+      if (meeting) {
+        const recordings = await this.recRepo.find({ where: { meetingId: meeting.id } });
+        if (recordings.length > 0) {
+          for (const recording of recordings) {
+            targets.push({
+              zoomRecordingId: recording.zoomRecordingId,
+              recording,
+              meeting,
+              meetingId: meeting.id,
+              zoomMeetingId: meeting.zoomMeetingId,
+              courseIdMoodle: meeting.courseIdMoodle,
+              topic: meeting.topic,
+            });
+          }
+        } else {
+          targets.push({
+            meeting,
+            meetingId: meeting.id,
+            zoomMeetingId: meeting.zoomMeetingId,
+            courseIdMoodle: meeting.courseIdMoodle,
+            topic: meeting.topic,
+          });
+        }
+      } else {
+        // Meeting not in DB: query Zoom for metadata (topic) to enable auto-resolution
+        try {
+          const { ZoomRecordingsService } = await import('../zoom/zoom-recordings.service');
+          const zoomRecordingsService = new ZoomRecordingsService(this.configService);
+          const zoomRec = await zoomRecordingsService.getRecordingById(dto.zoomMeetingId);
+          if (zoomRec) {
+            targets.push({
+              zoomMeetingId: dto.zoomMeetingId,
+              topic: zoomRec.topic,
+            });
+          }
+        } catch {}
+      }
+    }
+
+    if (dto.from && dto.to) {
+      // Time range query
+      const fromDate = new Date(dto.from);
+      const toDate = new Date(dto.to);
+      
+      // Get recordings in time range
+      const recordings = await this.recRepo.createQueryBuilder('r')
+        .leftJoinAndSelect('r.meeting', 'm')
+        .where('r.createdAt >= :from AND r.createdAt <= :to', { from: fromDate, to: toDate })
+        .limit(limit)
+        .getMany();
+
+      for (const recording of recordings) {
+        const meeting = await this.meetingRepo.findOne({ where: { id: recording.meetingId } });
+        targets.push({
+          zoomRecordingId: recording.zoomRecordingId,
+          recording,
+          meeting,
+          meetingId: meeting?.id,
+          zoomMeetingId: meeting?.zoomMeetingId,
+          courseIdMoodle: meeting?.courseIdMoodle,
+          topic: meeting?.topic,
+        });
+      }
+    }
+
+    return targets.slice(0, limit);
+  }
+
+  private async processRetryTarget(target: any, dto: RetryRequestDTO): Promise<RetryResult> {
+    const selector = this.extractSelector(dto);
+    
+    try {
+      // If meeting does not exist yet but we have Zoom metadata, create it by resolving course from topic
+      if (!target.meeting && target.zoomMeetingId && target.topic) {
+        try {
+          const created = await this.resolveExternalMeetingFromTopic(String(target.zoomMeetingId), target.topic);
+          if (created) {
+            target.meeting = created;
+            target.meetingId = created.id;
+            target.courseIdMoodle = created.courseIdMoodle;
+          }
+        } catch {}
+      }
+      if (dto.dryRun) {
+        return {
+          selector,
+          mode: 'skipped',
+          status: 'skipped',
+          reason: 'dry-run',
+          ...this.extractTargetMetadata(target),
+        };
+      }
+
+      // Determine course
+      let courseIdMoodle = dto.overrideCourseIdMoodle || target.courseIdMoodle;
+      if (!courseIdMoodle && target.topic) {
+        // Resolve using the real zoomMeetingId and topic; also creates Meeting if missing
+        const resolved = await this.resolveExternalMeetingFromTopic(String(target.zoomMeetingId || 'manual-retry'), target.topic);
+        courseIdMoodle = resolved?.courseIdMoodle;
+        if (resolved) {
+          target.meeting = resolved;
+          target.meetingId = resolved.id;
+        }
+      }
+
+      if (!courseIdMoodle) {
+        return {
+          selector,
+          mode: 'skipped',
+          status: 'failed',
+          reason: 'no-course-resolved',
+          ...this.extractTargetMetadata(target),
+        };
+      }
+
+      // Check if already completed and not forced (only if driveUrl exists)
+      if (target.recording && target.recording.driveUrl && !dto.forceRedownload && !dto.forceRepost) {
+        // Already completed, might just need republish
+        if (dto.republish) {
+          return await this.executeRepublishMode(target, courseIdMoodle, dto, selector);
+        } else {
+          return {
+            selector,
+            mode: 'skipped',
+            status: 'skipped',
+            reason: 'already-completed',
+            ...this.extractTargetMetadata(target),
+          };
+        }
+      }
+
+      // Determine mode
+      const mode = this.determineRetryMode(target, dto);
+      this.logger.log(`retry:mode=${mode} - zoomRecordingId=${target.zoomRecordingId}`);
+
+      if (mode === 'republish') {
+        return await this.executeRepublishMode(target, courseIdMoodle, dto, selector);
+      } else {
+        return await this.executeFullMode(target, courseIdMoodle, dto, selector);
+      }
+
+    } catch (error) {
+      this.logger.error(`retry:fail - target=${JSON.stringify(selector)} error=${error.message}`);
+      return {
+        selector,
+        mode: 'skipped',
+        status: 'failed',
+        reason: error.message,
+        ...this.extractTargetMetadata(target),
+      };
+    }
+  }
+
+  private extractTargetMetadata(target: any) {
+    return {
+      meetingId: target.meetingId,
+      zoomMeetingId: target.zoomMeetingId,
+      driveUrl: target.recording?.driveUrl,
+    };
+  }
+
+  private determineRetryMode(target: any, dto: RetryRequestDTO): 'republish' | 'full' {
+    if (dto.forceRedownload) return 'full';
+    if (dto.republish && target.recording?.driveUrl) return 'republish';
+    return 'full';
+  }
+
+  private async executeRepublishMode(target: any, courseIdMoodle: number, dto: RetryRequestDTO, selector: any): Promise<RetryResult> {
+    try {
+      // Verify Drive file exists and is valid
+      if (!target.recording?.driveUrl) {
+        return {
+          selector,
+          mode: 'republish',
+          status: 'failed',
+          reason: 'no-drive-url-found',
+          courseIdMoodle,
+          ...this.extractTargetMetadata(target),
+        };
+      }
+
+      // Get forum and create post
+      const forumId = await this.moodleService.getRecordedForumId(courseIdMoodle);
+      const topic = target.topic || 'Clase grabada';
+      const zoomRecordingId = target.zoomRecordingId || 'unknown';
+      
+  const previewLink = target.recording.driveUrl.replace('/view', '/preview');
+  const iframe = `<p><iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe></p>`;
+      const subject = `${topic} [${zoomRecordingId}]`;
+
+      await this.moodleService.addForumDiscussion(forumId, subject, iframe);
+
+      // Update retry tracking
+      if (target.recording) {
+        await this.recRepo.update(target.recording.id, {
+          retryCount: (target.recording.retryCount || 0) + 1,
+          lastRetryAt: new Date(),
+        });
+      }
+
+      this.logger.log(`retry:done - mode=republish zoomRecordingId=${zoomRecordingId}`);
+
+      return {
+        selector,
+        mode: 'republish',
+        status: 'ok',
+        reason: 'republished-successfully',
+        courseIdMoodle,
+        ...this.extractTargetMetadata(target),
+      };
+
+    } catch (error) {
+      return {
+        selector,
+        mode: 'republish',
+        status: 'failed',
+        reason: error.message,
+        courseIdMoodle,
+        ...this.extractTargetMetadata(target),
+      };
+    }
+  }
+
+  private async executeFullMode(target: any, courseIdMoodle: number, dto: RetryRequestDTO, selector: any): Promise<RetryResult> {
+    try {
+      // Obtener información de la grabación desde Zoom
+      const { ZoomRecordingsService } = await import('../zoom/zoom-recordings.service');
+      const zoomRecordingsService = new ZoomRecordingsService(this.configService);
+      
+      const meeting = target.meeting || target;
+      const zoomMeetingId = meeting.zoomMeetingId;
+      
+      if (!zoomMeetingId) {
+        throw new Error('No zoomMeetingId found for full mode processing');
+      }
+
+      const zoomRecording = await zoomRecordingsService.getRecordingById(zoomMeetingId);
+      if (!zoomRecording) {
+        throw new Error('Recording not found in Zoom');
+      }
+
+      // Selección robusta de MP4: preferir tipos de mayor calidad, luego por tamaño
+      const mp4Candidates = (zoomRecording.recording_files || []).filter((f: any) => f.file_type === 'MP4' && f.status === 'completed');
+      const preferOrder = ['shared_screen_with_speaker_view', 'active_speaker', 'speaker_view', 'gallery_view'];
+      const mp4File = [...mp4Candidates].sort((a: any, b: any) => {
+        const ia = preferOrder.indexOf(a.recording_type);
+        const ib = preferOrder.indexOf(b.recording_type);
+        const wa = ia === -1 ? preferOrder.length : ia;
+        const wb = ib === -1 ? preferOrder.length : ib;
+        if (wa !== wb) return wa - wb;
+        return (b.file_size || 0) - (a.file_size || 0);
+      })[0];
+
+      if (!mp4File) {
+        throw new Error('MP4 file not found in Zoom recording');
+      }
+
+      const filename = `${zoomMeetingId}_${mp4File.id}.mp4`;
+      const downloadPath = path.join(process.cwd(), 'downloads', filename);
+
+      try {
+        // Descargar desde Zoom usando la URL de descarga (S2S OAuth)
+        await this.downloadZoomRecording(mp4File.download_url, downloadPath);
+        // Validar archivo descargado (tamaño y tipo)
+        const valid = await this.validateDownloadedFile(downloadPath, mp4File.file_size);
+        if (!valid) {
+          throw new Error('Downloaded file failed validation (size/type)');
+        }
+
+        // Resolver carpetas en Drive: curso y YYYY-MM
+        const courseFolderCode = String(courseIdMoodle);
+        const courseFolderId = await this.driveService.ensureFolder(courseFolderCode);
+        const monthFolderName = new Date().toISOString().slice(0, 7);
+        const monthFolderId = await this.driveService.ensureFolder(monthFolderName, courseFolderId);
+
+        // Subir a Drive al folder del mes
+        const uploadResult = await this.driveService.uploadFile(
+          downloadPath,
+          filename,
+          monthFolderId,
+          {
+            meetingId: meeting.id,
+            courseIdMoodle: courseIdMoodle,
+            zoomRecordingId: String(mp4File.id),
+            timeoutMs: this.DRIVE_UPLOAD_TIMEOUT_MS,
+          }
+        );
+
+        // Publicar en Moodle
+        const forumId = await this.moodleService.getRecordedForumId(courseIdMoodle);
+        const previewLink2 = uploadResult.webViewLink.replace('/view', '/preview');
+        const iframe2 = `<p><iframe src=\"${previewLink2}\" width=\"640\" height=\"360\" frameborder=\"0\" allow=\"autoplay; encrypted-media\" allowfullscreen=\"allowfullscreen\"></iframe></p>`;
+        const moodleResult = await this.moodleService.addForumDiscussion(
+          forumId,
+          `Grabación disponible: ${meeting.topic}`,
+          iframe2
+        );
+
+        // Crear o actualizar recording
+        let recording = target.recording || target;
+        if (!recording.id) {
+          recording = this.recRepo.create({
+            meetingId: meeting.id,
+            zoomRecordingId: mp4File.id,
+            driveUrl: uploadResult.webViewLink,
+          });
+        } else {
+          recording.driveUrl = uploadResult.webViewLink;
+        }
+        
+        await this.recRepo.save(recording);
+
+        this.logger.log(`Full mode completed for zoomMeetingId ${zoomMeetingId}: Drive=${uploadResult.fileId}, Moodle=${moodleResult.discussionid}`);
+
+        return {
+          selector,
+          mode: 'full',
+          status: 'ok',
+          reason: 'full-processing-completed',
+          courseIdMoodle,
+          driveUrl: uploadResult.webViewLink,
+          moodlePostId: moodleResult.discussionid,
+          integrity: {
+            localMd5: await this.md5File(downloadPath),
+            driveMd5: uploadResult.md5Checksum,
+            sizeBytes: mp4File.file_size,
+          },
+          meetingId: meeting.id,
+          zoomMeetingId,
+        };
+
+      } finally {
+        // Limpiar archivo temporal
+        if (fs.existsSync(downloadPath)) {
+          fs.unlinkSync(downloadPath);
+          this.logger.debug(`Cleaned up temporary file: ${downloadPath}`);
+        }
+      }
+
+    } catch (error) {
+      this.logger.error(`Full mode failed for selector ${JSON.stringify(selector)}:`, error);
+      
+      return {
+        selector,
+        mode: 'full',
+        status: 'failed',
+        reason: `full-mode-error: ${error.message}`,
+        courseIdMoodle,
+        ...this.extractTargetMetadata(target),
+      };
+    }
   }
 
   private async withRetries<T>(fn: () => Promise<T>, attempts = 3, backoffMs = 1000): Promise<T> {

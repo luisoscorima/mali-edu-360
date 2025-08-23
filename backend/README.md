@@ -57,18 +57,40 @@ $ npm run test:e2e
 $ npm run test:cov
 ```
 
-## Deployment
+## Deployment (Docker)
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+This service ships with a Dockerfile and docker-compose to run in production.
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+1) Copy `.env.example` to `backend/.env` and fill values:
+
+- Database: `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME`.
+- Zoom S2S OAuth: `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET`.
+- Webhook: `ZOOM_WEBHOOK_SECRET` (and set `ZOOM_WEBHOOK_DISABLE_SIGNATURE=false` in prod).
+- Google Drive: set `GDRIVE_SHARED_DRIVE_ID` and keep `GDRIVE_CREDENTIALS_PATH=/run/secrets/gdrive-credentials.json`.
+- Moodle: `MOODLE_BASE_URL`, `MOODLE_TOKEN`, `DEFAULT_COURSE_ID_MOODLE`.
+
+2) Place your Google service account credentials file at `backend/gdrive-credentials.json` (bound read-only in compose).
+
+3) Start services:
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+docker compose up -d --build
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+The backend will listen on port 3000.
+
+### Webhooks (Zoom)
+
+Expose your service over HTTPS (e.g., reverse proxy or ngrok) and configure Zoom Webhook (Recording events) to:
+
+- Endpoint URL: `https://<your-domain>/zoom/webhook`
+- Secret Token: use the same `ZOOM_WEBHOOK_SECRET`.
+
+If you need to test without signature verification, set `ZOOM_WEBHOOK_DISABLE_SIGNATURE=true` (not recommended for production).
+
+### Health checks
+
+Optionally map a simple GET route (e.g., `/`) in AppModule if you need a health probe. Currently the app starts and exposes routes under `/admin/*`, `/zoom/webhook`, etc.
 
 ## Resources
 

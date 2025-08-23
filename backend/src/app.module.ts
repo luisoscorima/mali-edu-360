@@ -6,6 +6,7 @@ import { ZoomLicensesModule } from './zoom-licenses/zoom-licenses.module';
 import { RecordingsModule } from './recordings/recordings.module';
 import { DriveModule } from './drive/drive.module';
 import { MoodleModule } from './moodle/moodle.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { MoodleModule } from './moodle/moodle.module';
     RecordingsModule,
     DriveModule,
     MoodleModule,
+    AdminModule,
   ],
 })
 export class AppModule { }

@@ -19,4 +19,10 @@ export class Recording {
 
   @CreateDateColumn({ type: 'timestamp with time zone' })
   createdAt: Date;
+
+  @Column({ type: 'timestamp', nullable: true })
+  lastRetryAt?: Date;
+
+  @Column({ type: 'int', default: 0 })
+  retryCount: number;
 }

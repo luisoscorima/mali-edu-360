@@ -168,16 +168,24 @@ export class DriveService implements OnModuleInit {
 
     const fileId = file.id;
 
-    // 4) Permisos: anyone with link (reader)
+    // 4) Permisos: anyone with link (reader) + restricción de descarga
     try {
       await this.drive.permissions.create({
         fileId,
         requestBody: { role: 'reader', type: 'anyone' },
         supportsAllDrives: true,
       });
-      this.logger.log(`Permisos actualizados: anyone with link (reader)`);
+      
+      // Actualizar archivo para restringir descarga
+      await this.drive.files.update({
+        fileId,
+        requestBody: { copyRequiresWriterPermission: true },
+        supportsAllDrives: true,
+      });
+      
+      this.logger.log(`Permisos actualizados: anyone with link (reader) + sin descarga`);
     } catch (e) {
-      this.logger.warn(`No se pudo hacer público el archivo: ${fileId} -> ${String((e as any)?.message || e)}`);
+      this.logger.warn(`No se pudo configurar permisos del archivo: ${fileId} -> ${String((e as any)?.message || e)}`);
     }
 
     this.logger.log(`Archivo subido a Drive (ID=${fileId})`);
@@ -214,6 +222,7 @@ export class DriveService implements OnModuleInit {
       name: args.name,
       parents: args.parents,
       appProperties: args.appProperties,
+      copyRequiresWriterPermission: true, // Evita descarga por lectores
     } as any;
 
     const res = await axios.post(url, body, {
