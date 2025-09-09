@@ -204,7 +204,7 @@ export class RecordingsService {
       const forumId = await this.moodleService.getRecordedForumId(meeting!.courseIdMoodle!);
       this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting!.courseIdMoodle}`);
       const previewLink = driveLink.replace('/view', '/preview');
-      const iframe = `<p><iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe></p>`;
+      const iframe = `<div style="max-width: 720px; width: 80vw; margin: 20px auto;"><div style="position: relative; width: 100%; padding-top: 56.25%;"><iframe style="position: absolute; inset: 0; width: 100%; height: 100%; border: 0;" src="${previewLink}" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe><div style="position: absolute; top: 8px; right: 8px; width: 72px; height: 72px; z-index: 3; background: transparent; cursor: not-allowed;" title="Pop-out deshabilitado" aria-label="Pop-out deshabilitado"></div></div></div>`;
       const downloadDate = new Date().toISOString().slice(0, 10);
       const subject = `${topic || 'Clase grabada'} | ${downloadDate} [${zoomRecordingId}]`;
       await this.withRobustRetries('upload', async () => {
@@ -635,7 +635,7 @@ export class RecordingsService {
       const zoomRecordingId = target.zoomRecordingId || 'unknown';
 
       const previewLink = target.recording.driveUrl.replace('/view', '/preview');
-      const iframe = `<p><iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe></p>`;
+      const iframe = `<div style="max-width: 720px; width: 80vw; margin: 20px auto;"><div style="position: relative; width: 100%; padding-top: 56.25%;"><iframe style="position: absolute; inset: 0; width: 100%; height: 100%; border: 0;" src="${previewLink}" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe><div style="position: absolute; top: 8px; right: 8px; width: 72px; height: 72px; z-index: 3; background: transparent; cursor: not-allowed;" title="Pop-out deshabilitado" aria-label="Pop-out deshabilitado"></div></div></div>`;
       const republishDate = new Date().toISOString().slice(0, 10);
       const subject = `${topic} | ${republishDate} [${zoomRecordingId}]`;
 
@@ -740,7 +740,7 @@ export class RecordingsService {
         // Publicar en Moodle
         const forumId = await this.moodleService.getRecordedForumId(courseIdMoodle);
         const previewLink2 = uploadResult.webViewLink.replace('/view', '/preview');
-        const iframe2 = `<p><iframe src=\"${previewLink2}\" width=\"640\" height=\"360\" frameborder=\"0\" allow=\"autoplay; encrypted-media\" allowfullscreen=\"allowfullscreen\"></iframe></p>`;
+        const iframe2 = `<div style="max-width: 720px; width: 80vw; margin: 20px auto;"><div style="position: relative; width: 100%; padding-top: 56.25%;"><iframe style="position: absolute; inset: 0; width: 100%; height: 100%; border: 0;" src="${previewLink2}" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe><div style="position: absolute; top: 8px; right: 8px; width: 72px; height: 72px; z-index: 3; background: transparent; cursor: not-allowed;" title="Pop-out deshabilitado" aria-label="Pop-out deshabilitado"></div></div></div>`;
         const moodleResult = await this.moodleService.addForumDiscussion(
           forumId,
           `Grabación disponible: ${meeting.topic}`,
