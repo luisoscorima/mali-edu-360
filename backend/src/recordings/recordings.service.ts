@@ -73,7 +73,7 @@ export class RecordingsService {
     private readonly zoomLicenses: ZoomLicensesService,
     private readonly zoomService: ZoomService,
     private readonly configService: ConfigService,
-  ) {}
+  ) { }
 
   /**
    * Handles Zoom event payload for recording.completed
@@ -83,9 +83,9 @@ export class RecordingsService {
     const topic: string | undefined = object?.topic;
     const zoomMeetingId: string | undefined = String(object?.id || object?.uuid || '');
     const files: any[] = object?.recording_files || [];
-  const downloadToken: string | undefined = payload?.download_token;
+    const downloadToken: string | undefined = payload?.download_token;
 
-  this.logger.log(`recording.completed received - zoomMeetingId=${zoomMeetingId}, topic=${topic}, files=${files.length}`);
+    this.logger.log(`recording.completed received - zoomMeetingId=${zoomMeetingId}, topic=${topic}, files=${files.length}`);
 
     if (!zoomMeetingId || files.length === 0) {
       this.logger.warn('Webhook sin meetingId o archivos');
@@ -100,7 +100,7 @@ export class RecordingsService {
     if (zoomMeetingId) this.inFlightMeetings.add(zoomMeetingId);
 
     // Map Zoom meeting to our Meeting entity; if missing (e.g., created via Moodle LTI), try to infer by topic and create it
-  let meeting: Meeting | null = await this.meetingRepo.findOne({ where: { zoomMeetingId } });
+    let meeting: Meeting | null = await this.meetingRepo.findOne({ where: { zoomMeetingId } });
     if (!meeting) {
       this.logger.warn(`No se encontró Meeting para zoomMeetingId=${zoomMeetingId}. Intentando mapear por topic a curso Moodle (LTI)…`);
       try {
@@ -110,8 +110,8 @@ export class RecordingsService {
           if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
           return { status: 'ignored' };
         }
-  meeting = inferred;
-  this.logger.log(`Meeting creado por LTI: id=${meeting!.id}, courseIdMoodle=${meeting!.courseIdMoodle}`);
+        meeting = inferred;
+        this.logger.log(`Meeting creado por LTI: id=${meeting!.id}, courseIdMoodle=${meeting!.courseIdMoodle}`);
       } catch (e: any) {
         this.logger.warn(`Fallo al crear Meeting desde topic: ${e?.message || e}`);
         if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
@@ -132,102 +132,103 @@ export class RecordingsService {
     const expectedBytes: number | undefined = typeof mp4.file_size === 'number' ? mp4.file_size : undefined;
 
     try {
-    // Idempotency: if already processed locally or in Drive, exit gracefully
-    const existing = await this.recRepo.findOne({ where: { zoomRecordingId } });
-    if (existing) {
-      this.logger.log(`Idempotente: recording ya procesada (DB) zoomRecordingId=${zoomRecordingId}.`);
-      await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
-      await this.zoomLicenses.releaseLicense(meeting!.id);
-      return { status: 'done', driveUrl: existing.driveUrl };
-    }
-    const existingDrive = await this.driveService.findFileByZoomRecordingId(zoomRecordingId);
-    if (existingDrive) {
-      this.logger.log(`Idempotente: archivo ya en Drive por zoomRecordingId=${zoomRecordingId}. Creando registro en DB y cerrando flujo.`);
-      const rec = this.recRepo.create({ meetingId: meeting!.id, zoomRecordingId, driveUrl: existingDrive.webViewLink });
-      await this.recRepo.save(rec);
-      await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
-      await this.zoomLicenses.releaseLicense(meeting!.id);
-  return { status: 'done', driveUrl: existingDrive.webViewLink };
-    }
-
-    // 1) Download with retries (long-running, resumable)
-  const filename = `${(topic || 'Clase').replace(/[^a-zA-Z0-9-_]/g, '_')}_${new Date().toISOString().slice(0, 10)}.mp4`;
-    const localPath = path.join(process.cwd(), 'downloads', filename);
-    await this.ensureDownloadDir();
-  this.logger.log(`Descargando grabación desde Zoom a: ${localPath}`);
-
-    const dlStartedAt = Date.now();
-    const headInfo = await this.warmupHead(mp4.download_url, downloadToken);
-    if (headInfo && headInfo.contentLength && expectedBytes && Math.abs(headInfo.contentLength - expectedBytes) / expectedBytes > 0.01) {
-      this.logger.warn(`HEAD size difiere de payload: head=${headInfo.contentLength} payload=${expectedBytes}`);
-    }
-    await this.withRobustRetries('download', async (attempt) => {
-      const info = await this.downloadZoomRecording(mp4.download_url, localPath, downloadToken);
-      // Pre-upload validations
-  const ok = await this.validateDownloadedFile(localPath, expectedBytes, info.contentType);
-      if (!ok) {
-        // Eliminar archivo parcial para que el siguiente intento no use Range inválido
-        try { fs.unlinkSync(localPath); } catch {}
-        throw new Error('Archivo descargado inválido o incompleto');
+      // Idempotency: if already processed locally or in Drive, exit gracefully
+      const existing = await this.recRepo.findOne({ where: { zoomRecordingId } });
+      if (existing) {
+        this.logger.log(`Idempotente: recording ya procesada (DB) zoomRecordingId=${zoomRecordingId}.`);
+        await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
+        await this.zoomLicenses.releaseLicense(meeting!.id);
+        return { status: 'done', driveUrl: existing.driveUrl };
       }
-    });
-    const dlMs = Date.now() - dlStartedAt;
-    const { size: finalDownloadSize } = fs.statSync(localPath);
-    this.logger.log(`Descarga completa (${finalDownloadSize} bytes) en ${Math.round(dlMs / 1000)}s.`);
+      const existingDrive = await this.driveService.findFileByZoomRecordingId(zoomRecordingId);
+      if (existingDrive) {
+        this.logger.log(`Idempotente: archivo ya en Drive por zoomRecordingId=${zoomRecordingId}. Creando registro en DB y cerrando flujo.`);
+        const rec = this.recRepo.create({ meetingId: meeting!.id, zoomRecordingId, driveUrl: existingDrive.webViewLink });
+        await this.recRepo.save(rec);
+        await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
+        await this.zoomLicenses.releaseLicense(meeting!.id);
+        return { status: 'done', driveUrl: existingDrive.webViewLink };
+      }
 
-    // 2) Upload to Drive into course folder + yyyy-mm
-  const courseFolderCode = String(meeting!.courseIdMoodle);
-  const rootDrive = process.env.GDRIVE_SHARED_DRIVE_ID ?? '';
-  const courseFolderId = await this.driveService.ensureFolder(courseFolderCode, rootDrive);
-  this.logger.log(`Carpeta curso en Drive: ${courseFolderCode} -> ${courseFolderId}`);
-    const monthFolderId = await this.driveService.ensureFolder(new Date().toISOString().slice(0, 7), courseFolderId);
-    const upStartedAt = Date.now();
-    const upload = await this.withRobustRetries('upload', async (attempt) => {
-      const res = await this.driveService.uploadFile(localPath, filename, monthFolderId, {
-        meetingId: meeting!.id,
-        courseIdMoodle: meeting!.courseIdMoodle!,
-        zoomRecordingId,
-        timeoutMs: this.DRIVE_UPLOAD_TIMEOUT_MS,
+      // 1) Download with retries (long-running, resumable)
+      const filename = `${(topic || 'Clase').replace(/[^a-zA-Z0-9-_]/g, '_')}_${new Date().toISOString().slice(0, 10)}.mp4`;
+      const localPath = path.join(process.cwd(), 'downloads', filename);
+      await this.ensureDownloadDir();
+      this.logger.log(`Descargando grabación desde Zoom a: ${localPath}`);
+
+      const dlStartedAt = Date.now();
+      const headInfo = await this.warmupHead(mp4.download_url, downloadToken);
+      if (headInfo && headInfo.contentLength && expectedBytes && Math.abs(headInfo.contentLength - expectedBytes) / expectedBytes > 0.01) {
+        this.logger.warn(`HEAD size difiere de payload: head=${headInfo.contentLength} payload=${expectedBytes}`);
+      }
+      await this.withRobustRetries('download', async (attempt) => {
+        const info = await this.downloadZoomRecording(mp4.download_url, localPath, downloadToken);
+        // Pre-upload validations
+        const ok = await this.validateDownloadedFile(localPath, expectedBytes, info.contentType);
+        if (!ok) {
+          // Eliminar archivo parcial para que el siguiente intento no use Range inválido
+          try { fs.unlinkSync(localPath); } catch { }
+          throw new Error('Archivo descargado inválido o incompleto');
+        }
       });
-      // Verify MD5
-      const localMd5 = await this.md5File(localPath);
-      if (res.md5Checksum && res.md5Checksum !== localMd5) {
-        this.logger.warn(`MD5 mismatch: drive=${res.md5Checksum} local=${localMd5}`);
-        throw new Error('MD5 checksum mismatch after upload');
-      }
-      return { ...res, localMd5 };
-    });
-    const driveLink = upload.webViewLink;
-    const upMs = Date.now() - upStartedAt;
-    this.logger.log(`Archivo subido a Drive: ${driveLink} | md5=${upload.md5Checksum || upload.localMd5} | ${Math.round(upMs / 1000)}s`);
+      const dlMs = Date.now() - dlStartedAt;
+      const { size: finalDownloadSize } = fs.statSync(localPath);
+      this.logger.log(`Descarga completa (${finalDownloadSize} bytes) en ${Math.round(dlMs / 1000)}s.`);
 
-  const forumId = await this.moodleService.getRecordedForumId(meeting!.courseIdMoodle!);
-  this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting!.courseIdMoodle}`);
-  const previewLink = driveLink.replace('/view', '/preview');
-  const iframe = `<p><iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe></p>`;
-    const subject = `${topic || 'Clase grabada'} [${zoomRecordingId}]`;
-    await this.withRobustRetries('upload', async () => {
-      await this.moodleService.addForumDiscussion(forumId, subject, iframe);
-    });
+      // 2) Upload to Drive into course folder + yyyy-mm
+      const courseFolderCode = String(meeting!.courseIdMoodle);
+      const rootDrive = process.env.GDRIVE_SHARED_DRIVE_ID ?? '';
+      const courseFolderId = await this.driveService.ensureFolder(courseFolderCode, rootDrive);
+      this.logger.log(`Carpeta curso en Drive: ${courseFolderCode} -> ${courseFolderId}`);
+      const monthFolderId = await this.driveService.ensureFolder(new Date().toISOString().slice(0, 7), courseFolderId);
+      const upStartedAt = Date.now();
+      const upload = await this.withRobustRetries('upload', async (attempt) => {
+        const res = await this.driveService.uploadFile(localPath, filename, monthFolderId, {
+          meetingId: meeting!.id,
+          courseIdMoodle: meeting!.courseIdMoodle!,
+          zoomRecordingId,
+          timeoutMs: this.DRIVE_UPLOAD_TIMEOUT_MS,
+        });
+        // Verify MD5
+        const localMd5 = await this.md5File(localPath);
+        if (res.md5Checksum && res.md5Checksum !== localMd5) {
+          this.logger.warn(`MD5 mismatch: drive=${res.md5Checksum} local=${localMd5}`);
+          throw new Error('MD5 checksum mismatch after upload');
+        }
+        return { ...res, localMd5 };
+      });
+      const driveLink = upload.webViewLink;
+      const upMs = Date.now() - upStartedAt;
+      this.logger.log(`Archivo subido a Drive: ${driveLink} | md5=${upload.md5Checksum || upload.localMd5} | ${Math.round(upMs / 1000)}s`);
 
-    // 4) Persist Recording
-    const rec = this.recRepo.create({
-  meetingId: meeting!.id,
-      zoomRecordingId,
-      driveUrl: driveLink,
-    });
-    await this.recRepo.save(rec);
+      const forumId = await this.moodleService.getRecordedForumId(meeting!.courseIdMoodle!);
+      this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting!.courseIdMoodle}`);
+      const previewLink = driveLink.replace('/view', '/preview');
+      const iframe = `<p><iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe></p>`;
+      const downloadDate = new Date().toISOString().slice(0, 10);
+      const subject = `${topic || 'Clase grabada'} | ${downloadDate} [${zoomRecordingId}]`;
+      await this.withRobustRetries('upload', async () => {
+        await this.moodleService.addForumDiscussion(forumId, subject, iframe);
+      });
 
-    // 5) Update meeting and release license
-  await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
-    await this.zoomLicenses.releaseLicense(meeting!.id);
+      // 4) Persist Recording
+      const rec = this.recRepo.create({
+        meetingId: meeting!.id,
+        zoomRecordingId,
+        driveUrl: driveLink,
+      });
+      await this.recRepo.save(rec);
 
-    // 6) Cleanup local file
-    try { fs.unlinkSync(localPath); } catch {}
+      // 5) Update meeting and release license
+      await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
+      await this.zoomLicenses.releaseLicense(meeting!.id);
 
-    this.logger.log(`Pipeline OK | tiempo total: descarga ${Math.round(dlMs/1000)}s + subida ${Math.round(upMs/1000)}s`);
-    this.logger.log(`Grabación procesada y publicada: ${previewLink}`);
-    return { status: 'done', driveUrl: driveLink };
+      // 6) Cleanup local file
+      try { fs.unlinkSync(localPath); } catch { }
+
+      this.logger.log(`Pipeline OK | tiempo total: descarga ${Math.round(dlMs / 1000)}s + subida ${Math.round(upMs / 1000)}s`);
+      this.logger.log(`Grabación procesada y publicada: ${previewLink}`);
+      return { status: 'done', driveUrl: driveLink };
     } finally {
       if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
     }
@@ -249,22 +250,22 @@ export class RecordingsService {
       try {
         const exact = await this.moodleService.findCourseIdByFullnameExact(candidate);
         if (exact) return exact;
-      } catch {}
+      } catch { }
       // 1) fullname
       try {
         const id = await this.moodleService.findCourseIdByField('fullname', candidate);
         return id;
-      } catch {}
+      } catch { }
       // 2) shortname
       try {
         const id = await this.moodleService.findCourseIdByField('shortname', candidate);
         return id;
-      } catch {}
+      } catch { }
       // 3) search (first result)
       try {
         const id = await this.moodleService.searchCourseIdByName(candidate);
         if (id) return id;
-      } catch {}
+      } catch { }
       return null;
     };
 
@@ -279,7 +280,7 @@ export class RecordingsService {
       if (noParens && noParens !== trimmed) candidates.push(noParens);
       const splitDash = trimmed.split(/\s*[-–—:\|]\s*/)[0]?.trim();
       if (splitDash && splitDash.length >= 3 && splitDash !== trimmed) candidates.push(splitDash);
-      const rmSuffixUpper2 = trimmed.replace(/\s+[A-Z]{1,3}$/,'').trim(); // e.g., "EP"
+      const rmSuffixUpper2 = trimmed.replace(/\s+[A-Z]{1,3}$/, '').trim(); // e.g., "EP"
       if (rmSuffixUpper2 && rmSuffixUpper2.length >= 3 && rmSuffixUpper2 !== trimmed) candidates.push(rmSuffixUpper2);
 
       for (const cand of candidates) {
@@ -319,7 +320,7 @@ export class RecordingsService {
       startTime: new Date(),
       status: 'scheduled',
     } as DeepPartial<Meeting>);
-  const saved = (await this.meetingRepo.save(entity)) as Meeting;
+    const saved = (await this.meetingRepo.save(entity)) as Meeting;
     return saved;
   }
 
@@ -328,7 +329,7 @@ export class RecordingsService {
    */
   async manualRetry(dto: RetryRequestDTO): Promise<RetryResult[]> {
     this.logger.log(`retry:start - selector=${JSON.stringify(this.extractSelector(dto))}`);
-    
+
     const limit = dto.limit ?? 5;
     const results: RetryResult[] = [];
 
@@ -340,7 +341,7 @@ export class RecordingsService {
       // Process each target
       for (const target of targets) {
         const guardKey = target.zoomRecordingId || target.meetingId || 'unknown';
-        
+
         // Check if already being processed
         if (this.retryGuard.has(guardKey)) {
           results.push({
@@ -397,7 +398,7 @@ export class RecordingsService {
         where: { zoomRecordingId: dto.zoomRecordingId },
         relations: ['meeting'], // if you have relations set up
       });
-      
+
       let meeting: Meeting | undefined;
       if (recording?.meetingId) {
         meeting = await this.meetingRepo.findOne({ where: { id: recording.meetingId } }) || undefined;
@@ -482,7 +483,7 @@ export class RecordingsService {
               topic: zoomRec.topic,
             });
           }
-        } catch {}
+        } catch { }
       }
     }
 
@@ -490,7 +491,7 @@ export class RecordingsService {
       // Time range query
       const fromDate = new Date(dto.from);
       const toDate = new Date(dto.to);
-      
+
       // Get recordings in time range
       const recordings = await this.recRepo.createQueryBuilder('r')
         .leftJoinAndSelect('r.meeting', 'm')
@@ -517,7 +518,7 @@ export class RecordingsService {
 
   private async processRetryTarget(target: any, dto: RetryRequestDTO): Promise<RetryResult> {
     const selector = this.extractSelector(dto);
-    
+
     try {
       // If meeting does not exist yet but we have Zoom metadata, create it by resolving course from topic
       if (!target.meeting && target.zoomMeetingId && target.topic) {
@@ -528,7 +529,7 @@ export class RecordingsService {
             target.meetingId = created.id;
             target.courseIdMoodle = created.courseIdMoodle;
           }
-        } catch {}
+        } catch { }
       }
       if (dto.dryRun) {
         return {
@@ -632,10 +633,11 @@ export class RecordingsService {
       const forumId = await this.moodleService.getRecordedForumId(courseIdMoodle);
       const topic = target.topic || 'Clase grabada';
       const zoomRecordingId = target.zoomRecordingId || 'unknown';
-      
-  const previewLink = target.recording.driveUrl.replace('/view', '/preview');
-  const iframe = `<p><iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe></p>`;
-      const subject = `${topic} [${zoomRecordingId}]`;
+
+      const previewLink = target.recording.driveUrl.replace('/view', '/preview');
+      const iframe = `<p><iframe src="${previewLink}" width="640" height="360" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe></p>`;
+      const republishDate = new Date().toISOString().slice(0, 10);
+      const subject = `${topic} | ${republishDate} [${zoomRecordingId}]`;
 
       await this.moodleService.addForumDiscussion(forumId, subject, iframe);
 
@@ -675,10 +677,10 @@ export class RecordingsService {
       // Obtener información de la grabación desde Zoom
       const { ZoomRecordingsService } = await import('../zoom/zoom-recordings.service');
       const zoomRecordingsService = new ZoomRecordingsService(this.configService);
-      
+
       const meeting = target.meeting || target;
       const zoomMeetingId = meeting.zoomMeetingId;
-      
+
       if (!zoomMeetingId) {
         throw new Error('No zoomMeetingId found for full mode processing');
       }
@@ -756,7 +758,7 @@ export class RecordingsService {
         } else {
           recording.driveUrl = uploadResult.webViewLink;
         }
-        
+
         await this.recRepo.save(recording);
 
         this.logger.log(`Full mode completed for zoomMeetingId ${zoomMeetingId}: Drive=${uploadResult.fileId}, Moodle=${moodleResult.discussionid}`);
@@ -788,7 +790,7 @@ export class RecordingsService {
 
     } catch (error) {
       this.logger.error(`Full mode failed for selector ${JSON.stringify(selector)}:`, error);
-      
+
       return {
         selector,
         mode: 'full',
@@ -910,7 +912,7 @@ export class RecordingsService {
           startByte = st.size;
           flags = 'a';
         }
-      } catch {}
+      } catch { }
     }
 
     // Prepare request headers
@@ -956,7 +958,7 @@ export class RecordingsService {
     if (status === 206) this.logger.log('Reanudando descarga (206 Partial Content)');
     if (status === 416) {
       // Rango inválido: reiniciar desde cero en el siguiente intento
-      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch { }
       throw new Error('Descarga fallo status=416');
     }
     if (status < 200 || status >= 300) {
