@@ -121,8 +121,10 @@ export class RecordingsService {
       this.logger.log(`Meeting encontrado: id=${meeting.id}, courseIdMoodle=${meeting.courseIdMoodle}`);
     }
 
-    // Process the first MP4 recording file
-    const mp4 = files.find((f) => f.file_type === 'MP4' && f.download_url);
+    // Seleccionar el archivo MP4 preferentemente con estado "completed"; fallback a cualquier MP4 con URL
+    const mp4 =
+      files.find((f: any) => f.file_type === 'MP4' && f.download_url && (f.status === 'completed' || f.recording_status === 'completed')) ||
+      files.find((f: any) => f.file_type === 'MP4' && f.download_url);
     if (!mp4) {
       this.logger.warn('No hay archivo MP4 en la grabación');
       return { status: 'ignored' };
@@ -157,13 +159,23 @@ export class RecordingsService {
       this.logger.log(`Descargando grabación desde Zoom a: ${localPath}`);
 
       const dlStartedAt = Date.now();
-      const headInfo = await this.warmupHead(mp4.download_url, downloadToken);
-      if (headInfo && headInfo.contentLength && expectedBytes && Math.abs(headInfo.contentLength - expectedBytes) / expectedBytes > 0.01) {
-        this.logger.warn(`HEAD size difiere de payload: head=${headInfo.contentLength} payload=${expectedBytes}`);
-      }
       await this.withRobustRetries('download', async (attempt) => {
-        const info = await this.downloadZoomRecording(mp4.download_url, localPath, downloadToken);
-        // Pre-upload validations
+        // Intento 1: usar download_token del webhook (si existe). Siguientes intentos: forzar OAuth (token interno) para evitar token rancio/expirado.
+        const tokenForThisAttempt = attempt === 1 ? downloadToken : undefined;
+
+        // HEAD fresco en cada intento para detectar readiness y refrescar autorización.
+        const headInfo = await this.warmupHead(mp4.download_url, tokenForThisAttempt);
+        const minBytes = this.MIN_EXPECTED_SIZE_MB * 1024 * 1024;
+        if (headInfo?.contentLength && headInfo.contentLength < minBytes) {
+          // Aún no listo o placeholder de Zoom. Provocar reintento con backoff.
+          throw new Error(`Recording not ready (HEAD content-length=${headInfo.contentLength})`);
+        }
+        if (headInfo && headInfo.contentLength && expectedBytes && Math.abs(headInfo.contentLength - expectedBytes) / expectedBytes > 0.01) {
+          this.logger.warn(`HEAD size difiere de payload: head=${headInfo.contentLength} payload=${expectedBytes}`);
+        }
+
+        const info = await this.downloadZoomRecording(mp4.download_url, localPath, tokenForThisAttempt);
+        // Validaciones previas a la subida
         const ok = await this.validateDownloadedFile(localPath, expectedBytes, info.contentType);
         if (!ok) {
           // Eliminar archivo parcial para que el siguiente intento no use Range inválido
