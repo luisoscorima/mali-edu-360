@@ -57,7 +57,7 @@ export class RecordingsService {
   // Config defaults (overridable via env)
   private readonly MAX_RETRIES_DOWNLOAD = this.getIntEnv('MAX_RETRIES_DOWNLOAD', 10);
   private readonly MAX_RETRIES_UPLOAD = this.getIntEnv('MAX_RETRIES_UPLOAD', 10);
-  private readonly INITIAL_BACKOFF_MS = this.getIntEnv('INITIAL_BACKOFF_MS', 15000);
+  private readonly INITIAL_BACKOFF_MS = this.getIntEnv('INITIAL_BACKOFF_MS', 30000);
   private readonly MAX_BACKOFF_MS = this.getIntEnv('MAX_BACKOFF_MS', 300000);
   private readonly DOWNLOAD_TIMEOUT_MS = this.getIntEnv('DOWNLOAD_TIMEOUT_MS', 0); // 0 = no limit
   private readonly DRIVE_UPLOAD_TIMEOUT_MS = this.getIntEnv('DRIVE_UPLOAD_TIMEOUT_MS', 0);
