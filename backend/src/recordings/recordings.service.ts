@@ -62,6 +62,8 @@ export class RecordingsService {
   private readonly DOWNLOAD_TIMEOUT_MS = this.getIntEnv('DOWNLOAD_TIMEOUT_MS', 0); // 0 = no limit
   private readonly DRIVE_UPLOAD_TIMEOUT_MS = this.getIntEnv('DRIVE_UPLOAD_TIMEOUT_MS', 0);
   private readonly MIN_EXPECTED_SIZE_MB = this.getIntEnv('MIN_EXPECTED_SIZE_MB', 1);
+  // Espera antes de publicar en Moodle para dar tiempo al preview de Drive (ms)
+  private readonly PREPUBLISH_DELAY_MS = this.getIntEnv('PREPUBLISH_DELAY_MS', 600000);
 
   constructor(
     @InjectRepository(Recording)
@@ -212,6 +214,12 @@ export class RecordingsService {
       const driveLink = upload.webViewLink;
       const upMs = Date.now() - upStartedAt;
       this.logger.log(`Archivo subido a Drive: ${driveLink} | md5=${upload.md5Checksum || upload.localMd5} | ${Math.round(upMs / 1000)}s`);
+
+      // Esperar para que el reproductor de Drive esté listo
+      if (this.PREPUBLISH_DELAY_MS > 0) {
+        this.logger.log(`Esperando ${Math.round(this.PREPUBLISH_DELAY_MS / 1000)}s para que Drive procese el preview…`);
+        await this.sleep(this.PREPUBLISH_DELAY_MS);
+      }
 
       const forumId = await this.moodleService.getRecordedForumId(meeting!.courseIdMoodle!);
       this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting!.courseIdMoodle}`);
