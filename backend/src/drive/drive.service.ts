@@ -120,9 +120,10 @@ export class DriveService implements OnModuleInit {
         'Content-Range': `bytes ${offset}-${end}/${total}`,
       };
 
-      const stream = fs.createReadStream(filePath, { start: offset, end });
-
+      // FIX: Crear stream DENTRO del retry para que cada reintento tenga un stream fresco
+      // (si se crea fuera, el stream ya está consumido en reintentos y envía 0 bytes)
       const res = await this.withUploadRetries(async () => {
+        const stream = fs.createReadStream(filePath, { start: offset, end });
         return axios.put(sessionUrl, stream, {
           headers,
           maxBodyLength: Infinity,

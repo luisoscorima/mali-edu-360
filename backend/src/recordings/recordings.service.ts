@@ -53,6 +53,8 @@ export class RecordingsService {
   private readonly inFlightMeetings = new Set<string>();
   // Manual retry concurrency guard
   private readonly retryGuard = new Map<string, Promise<any>>();
+  // FIX #4: Lock por filepath para serializar operaciones sobre el mismo archivo
+  private readonly fileLocks = new Map<string, Promise<void>>();
 
   // Config defaults (overridable via env)
   private readonly MAX_RETRIES_DOWNLOAD = this.getIntEnv('MAX_RETRIES_DOWNLOAD', 10);
@@ -155,7 +157,11 @@ export class RecordingsService {
       }
 
       // 1) Download with retries (long-running, resumable)
-      const filename = `${(topic || 'Clase').replace(/[^a-zA-Z0-9-_]/g, '_')}_${new Date().toISOString().slice(0, 10)}.mp4`;
+      // FIX: Usar filename único con timestamp ISO completo + zoomRecordingId para evitar colisiones
+      // entre grabaciones del mismo día (incluso de cursos diferentes)
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const sanitizedTopic = (topic || 'Clase').replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 50);
+      const filename = `${sanitizedTopic}_${timestamp}_${zoomRecordingId}.mp4`;
       const localPath = path.join(process.cwd(), 'downloads', filename);
       await this.ensureDownloadDir();
       this.logger.log(`Descargando grabación desde Zoom a: ${localPath}`);
@@ -991,7 +997,9 @@ export class RecordingsService {
     await new Promise<void>((resolve, reject) => {
       const ws = fs.createWriteStream(filePath, { flags });
       res.data.pipe(ws);
-      ws.on('finish', resolve);
+      // FIX: Usar 'close' en lugar de 'finish' para asegurar que el archivo
+      // esté completamente escrito en disco (no solo en buffer del OS)
+      ws.on('close', resolve);
       ws.on('error', reject);
     });
 
@@ -1061,5 +1069,30 @@ export class RecordingsService {
     if (!v) return def;
     const n = Number(v);
     return Number.isFinite(n) ? n : def;
+  }
+
+  /**
+   * FIX #4: Lock por filepath para serializar operaciones concurrentes sobre el mismo archivo.
+   * Previene que dos procesos escriban/lean el mismo archivo simultáneamente.
+   */
+  private async withFileLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+    // Esperar si hay un lock activo para este filepath
+    while (this.fileLocks.has(filePath)) {
+      await this.fileLocks.get(filePath);
+    }
+
+    // Crear nuevo lock
+    let releaseLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    this.fileLocks.set(filePath, lockPromise);
+
+    try {
+      return await fn();
+    } finally {
+      releaseLock();
+      this.fileLocks.delete(filePath);
+    }
   }
 }
