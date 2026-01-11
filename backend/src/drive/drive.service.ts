@@ -87,7 +87,7 @@ export class DriveService implements OnModuleInit {
     filename: string,
     folderId: string,
     opts?: { meetingId?: string; courseIdMoodle?: number; zoomRecordingId?: string; timeoutMs?: number }
-  ): Promise<{ fileId: string; webViewLink: string; md5Checksum?: string }> {
+  ): Promise<{ fileId: string; webViewLink: string; md5Checksum?: string; sizeBytes?: number }> {
     const stat = fs.statSync(filePath);
     const total = stat.size;
     const chunkSize = this.getIntEnv('CHUNK_SIZE_MB', 32) * 1024 * 1024;
@@ -169,7 +169,16 @@ export class DriveService implements OnModuleInit {
 
     const fileId = file.id;
 
-    // 4) Permisos: anyone with link (reader) + restricción de descarga
+    // 4) Obtener metadata completa para validar integridad (size + md5)
+    const meta = await this.drive.files.get({
+      fileId,
+      fields: 'id, webViewLink, md5Checksum, size',
+      supportsAllDrives: true,
+    });
+    const remoteMd5 = meta.data.md5Checksum || file.md5Checksum || undefined;
+    const remoteSize = meta.data.size ? Number(meta.data.size) : undefined;
+
+    // 5) Permisos: anyone with link (reader) + restricción de descarga
     try {
       await this.drive.permissions.create({
         fileId,
@@ -177,7 +186,6 @@ export class DriveService implements OnModuleInit {
         supportsAllDrives: true,
       });
       
-      // Actualizar archivo para restringir descarga
       await this.drive.files.update({
         fileId,
         requestBody: { copyRequiresWriterPermission: true },
@@ -190,7 +198,7 @@ export class DriveService implements OnModuleInit {
     }
 
     this.logger.log(`Archivo subido a Drive (ID=${fileId})`);
-    return { fileId, webViewLink: file.webViewLink!, md5Checksum: file.md5Checksum || undefined };
+    return { fileId, webViewLink: meta.data.webViewLink || file.webViewLink!, md5Checksum: remoteMd5, sizeBytes: remoteSize };
   }
 
   /** Busca por appProperties.zoomRecordingId en el Shared Drive */

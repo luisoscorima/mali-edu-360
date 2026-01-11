@@ -1,120 +1,105 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+## Arquitectura del backend (edu-connect-backend)
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Backend NestJS que orquesta clases por Zoom, guarda grabaciones en Google Drive y publica en Moodle. Este README resume cómo está armado el servicio y sus flujos clave.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+### Stack y principios
+- NestJS 11 + TypeORM + PostgreSQL, configuración centralizada vía `@nestjs/config`.
+- Integraciones externas: Zoom (OAuth server-to-server), Google Drive (resumable upload), Moodle (WS REST).
+- Infra lista para contenedores (Dockerfile + docker-compose) y puerto 3000 por defecto.
 
-## Description
+## Mapa de módulos
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+- Núcleo: [src/app.module.ts](src/app.module.ts) registra configuración, TypeORM y los módulos de dominio.
+- Meetings: [src/meetings](src/meetings) crea reuniones en Zoom y persiste `Meeting`; asigna licencias libres y libera al cerrar.
+- Zoom Licenses: [src/zoom-licenses](src/zoom-licenses) gestiona el pool de cuentas Zoom disponibles.
+- Recordings: [src/recordings](src/recordings) procesa webhooks de grabación, descarga, sube a Drive y publica en Moodle; incluye reintentos manuales.
+- Drive: [src/drive](src/drive) abstrae Google Drive (carpetas por curso/mes, upload resumable, permisos de solo lectura sin descarga).
+- Moodle: [src/moodle](src/moodle) resuelve cursos, foros y publica discusiones con el embed del video.
+- Admin: [src/admin](src/admin) expone utilidades de sincronización histórica, depuración y creación de datos de prueba.
+- Zoom (utils): [src/zoom](src/zoom) obtiene access tokens y lista grabaciones históricas.
+- Otros módulos (`auth`, `calendar`, `courses`, `users`, `scheduler`) existen pero hoy están vacíos/stub y no se importan en `AppModule`.
 
-## Project setup
+## Entidades y persistencia
 
-```bash
-$ npm install
-```
+- Meeting: topic, `courseIdMoodle` (int), `zoomMeetingId`, `zoomLicenseId`, `startTime`, `status`, `joinUrl`, `startUrl` — [src/meetings/entities/meeting.entity.ts](src/meetings/entities/meeting.entity.ts).
+- Recording: `meetingId`, `zoomRecordingId`, `driveUrl`, `createdAt`, `lastRetryAt`, `retryCount` — [src/recordings/entities/recording.entity.ts](src/recordings/entities/recording.entity.ts).
+- ZoomLicense: email, `status` (`available`|`occupied`), `currentMeetingId` — [src/zoom-licenses/entities/zoom-license.entity.ts](src/zoom-licenses/entities/zoom-license.entity.ts).
+- Clases `User` y `Course` existen como modelos simples pero sin mapeo TypeORM ni uso actual.
 
-## Compile and run the project
+## Flujos principales
 
-```bash
-# development
-$ npm run start
+### 1) Creación de clases
+1. `POST /meetings` ([src/meetings/meetings.controller.ts](src/meetings/meetings.controller.ts)) recibe topic, `courseIdMoodle`, `startTime`.
+2. MeetingsService toma una licencia libre de Zoom Licenses, crea la reunión vía Zoom API y persiste el `Meeting` ([src/meetings/meetings.service.ts](src/meetings/meetings.service.ts)).
+3. La licencia queda marcada `occupied` y se libera cuando la grabación termina.
 
-# watch mode
-$ npm run start:dev
+### 2) Webhook de grabaciones (Zoom → Drive → Moodle)
+1. Zoom envía `recording.completed` a `/zoom/webhook`; se valida la firma HMAC y se normaliza el body crudo ([src/meetings/zoom-webhook.controller.ts](src/meetings/zoom-webhook.controller.ts), `main.ts` prepara `rawBody`).
+2. RecordingsService asegura idempotencia: revisa DB y Drive para evitar duplicados; resuelve el curso desde el topic si el meeting no existe (incluye fallback a `DEFAULT_COURSE_ID_MOODLE`).
+3. Descarga robusta con reintentos y backoff, valida tamaño/MD5, y sube a Drive en carpeta `<courseId>/<yyyy-MM>` con upload resumable ([src/recordings/recordings.service.ts](src/recordings/recordings.service.ts), [src/drive/drive.service.ts](src/drive/drive.service.ts)).
+4. Publica en el foro del curso con un iframe de preview y guarda `Recording`; marca el meeting como `completed` y libera la licencia.
+5. Limpia el archivo local en `downloads/` tras subirlo.
 
-# production mode
-$ npm run start:prod
-```
+### 3) Sincronización y retrabajo (admin)
+- Sincronizar historial: `POST /admin/zoom/sync-recordings` importa reuniones pasadas desde la API de Zoom, crea `Meeting` y placeholders de `Recording` (sin driveUrl) para luego reprocesar ([src/admin/admin-zoom.controller.ts](src/admin/admin-zoom.controller.ts), [src/admin/zoom-sync.service.ts](src/admin/zoom-sync.service.ts)).
+- Reintentos manuales: `POST /admin/recordings/retry` reprocesa por `zoomRecordingId`, `meetingId`, `zoomMeetingId` o rango de fechas (re-descarga, re-sube y re-publica según flags).
+- Depuración: `/admin/debug/*` lista meetings/recordings y estadísticas básicas; `/admin/test/create-test-meeting` genera datos dummy.
 
-## Run tests
+## API expuesta
 
-```bash
-# unit tests
-$ npm run test
+- Meetings: CRUD en `/meetings`.
+- Webhook Zoom: `POST /zoom/webhook` (alias `/api/zoom/webhook` para proxies).
+- Admin:
+  - `/admin/zoom/sync-recordings`, `/admin/zoom/recordings-to-retry`, `/admin/zoom/search-meeting`.
+  - `/admin/recordings/retry` (reprocesado puntual o por rango).
+  - `/admin/debug/*` y `/admin/test/*` para observabilidad y pruebas.
 
-# e2e tests
-$ npm run test:e2e
+## Infra y configuración
 
-# test coverage
-$ npm run test:cov
-```
-
-## Deployment (Docker)
-
-This service ships with a Dockerfile and docker-compose to run in production.
-
-1) Copy `.env.example` to `backend/.env` and fill values:
-
-- Database: `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME`.
+- Bootstrap: `rawBody` habilitado y middleware que redirige `/api/zoom/webhook` → `/zoom/webhook` ([src/main.ts](src/main.ts)).
+- Base de datos: TypeORM auto carga entidades y `synchronize=true`; SSL opcional con `DB_SSL=true` ([src/app.module.ts](src/app.module.ts)).
+- Google Drive: requiere `GDRIVE_CREDENTIALS_PATH` y `GDRIVE_SHARED_DRIVE_ID`; permisos se aplican como lector con descarga deshabilitada.
 - Zoom S2S OAuth: `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET`.
-- Webhook: `ZOOM_WEBHOOK_SECRET` (and set `ZOOM_WEBHOOK_DISABLE_SIGNATURE=false` in prod).
-- Google Drive: set `GDRIVE_SHARED_DRIVE_ID` and keep `GDRIVE_CREDENTIALS_PATH=/run/secrets/gdrive-credentials.json`.
-- Moodle: `MOODLE_BASE_URL`, `MOODLE_TOKEN`, `DEFAULT_COURSE_ID_MOODLE`.
+- Webhook: `ZOOM_WEBHOOK_SECRET` y bandera `ZOOM_WEBHOOK_DISABLE_SIGNATURE` para entornos de prueba.
+- Moodle WS: `MOODLE_URL`, `MOODLE_API_TOKEN`, `DEFAULT_COURSE_ID_MOODLE`; TTL de cache de cursos configurable (`MOODLE_COURSES_CACHE_MS`).
+- Tiempos y reintentos (descarga/subida) parametrizables vía env (`MAX_RETRIES_*`, `INITIAL_BACKOFF_MS`, `MAX_BACKOFF_MS`, `DRIVE_UPLOAD_TIMEOUT_MS`, etc.).
 
-2) Place your Google service account credentials file at `backend/gdrive-credentials.json` (bound read-only in compose).
+## Carpetas relevantes
 
-3) Start services:
-
-```bash
-docker compose up -d --build
+```
+src/
+├─ app.module.ts, main.ts
+├─ meetings/           # CRUD de reuniones, Zoom API, webhook dispatcher
+├─ recordings/         # Pipeline de grabación, reintentos, persistencia
+├─ drive/              # Cliente Google Drive (carpetas, uploads, permisos)
+├─ moodle/             # Cliente Moodle (cursos, foros, discusiones)
+├─ zoom-licenses/      # Pool de cuentas Zoom disponibles
+├─ zoom/               # Utilidades de grabaciones históricas y tokens
+├─ admin/              # Rutas de sincronización, debug y datos de prueba
+└─ (auth, calendar, courses, users, scheduler) # stubs hoy sin lógica
 ```
 
-The backend will listen on port 3000.
+## Secuencia de extremo a extremo (grabación)
 
-### Webhooks (Zoom)
+1. Docente programa clase → `/meetings` crea en Zoom y guarda `Meeting` con licencia.
+2. Clase ocurre en Zoom; al finalizar, Zoom envía `recording.completed` → `/zoom/webhook`.
+3. RecordingsService descarga MP4 con reintentos, valida integridad y sube a Drive (carpeta del curso + mes).
+4. Publica en foro Moodle con iframe de preview y guarda `Recording` en DB.
+5. Marca `Meeting.status=completed` y libera la licencia Zoom.
 
-Expose your service over HTTPS (e.g., reverse proxy or ngrok) and configure Zoom Webhook (Recording events) to:
+## Supuestos y backlog
 
-- Endpoint URL: `https://<your-domain>/zoom/webhook`
-- Secret Token: use the same `ZOOM_WEBHOOK_SECRET`.
+- Seguridad: no hay guardas/roles ni JWT aplicados; módulo `auth` está vacío.
+- Scheduler no ejecuta tareas periódicas hoy (archivo stub).
+- Entities `User` y `Course` no están enlazadas a TypeORM ni a controladores.
+- Considerar mover `synchronize=true` a migraciones en producción.
 
-If you need to test without signature verification, set `ZOOM_WEBHOOK_DISABLE_SIGNATURE=true` (not recommended for production).
+## Despliegue rápido
 
-### Health checks
+1. Copiar `.env.example` a `backend/.env` y completar variables (DB, Zoom, Drive, Moodle, webhook).
+2. Colocar `gdrive-credentials.json` en `backend/` o montar vía secret y referenciar con `GDRIVE_CREDENTIALS_PATH`.
+3. `docker compose up -d --build` (exponer 3000). Asegurar HTTPS para el webhook.
 
-Optionally map a simple GET route (e.g., `/`) in AppModule if you need a health probe. Currently the app starts and exposes routes under `/admin/*`, `/zoom/webhook`, etc.
+## Testing
 
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+- Unit y e2e previstos en scripts npm; hoy no hay suites escritas más allá de los stubs de Nest.
