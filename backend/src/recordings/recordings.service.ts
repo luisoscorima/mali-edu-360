@@ -430,7 +430,6 @@ export class RecordingsService {
       // Single recording by zoomRecordingId
       const recording = (await this.recRepo.findOne({
         where: { zoomRecordingId: dto.zoomRecordingId },
-        relations: ['meeting'],
       })) || undefined;
 
       let meeting: Meeting | undefined;
@@ -528,7 +527,6 @@ export class RecordingsService {
 
       // Get recordings in time range
       const recordings = await this.recRepo.createQueryBuilder('r')
-        .leftJoinAndSelect('r.meeting', 'm')
         .where('r.createdAt >= :from AND r.createdAt <= :to', { from: fromDate, to: toDate })
         .limit(limit)
         .getMany();
