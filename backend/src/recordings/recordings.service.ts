@@ -428,10 +428,10 @@ export class RecordingsService {
 
     if (dto.zoomRecordingId) {
       // Single recording by zoomRecordingId
-      const recording = await this.recRepo.findOne({
+      const recording = (await this.recRepo.findOne({
         where: { zoomRecordingId: dto.zoomRecordingId },
         relations: ['meeting'],
-      });
+      })) || undefined;
 
       let meeting: Meeting | undefined;
       if (recording?.meetingId) {
@@ -451,7 +451,7 @@ export class RecordingsService {
 
     if (dto.meetingId) {
       // Single meeting by internal meetingId
-      const meeting = await this.meetingRepo.findOne({ where: { id: dto.meetingId } });
+      const meeting = (await this.meetingRepo.findOne({ where: { id: dto.meetingId } })) || undefined;
       if (meeting) {
         const recordings = await this.recRepo.find({ where: { meetingId: dto.meetingId } });
         if (recordings.length > 0) {
@@ -481,7 +481,7 @@ export class RecordingsService {
 
     if (dto.zoomMeetingId) {
       // Single meeting by zoomMeetingId
-      const meeting = await this.meetingRepo.findOne({ where: { zoomMeetingId: dto.zoomMeetingId } });
+      const meeting = (await this.meetingRepo.findOne({ where: { zoomMeetingId: dto.zoomMeetingId } })) || undefined;
       if (meeting) {
         const recordings = await this.recRepo.find({ where: { meetingId: meeting.id } });
         if (recordings.length > 0) {
@@ -534,7 +534,7 @@ export class RecordingsService {
         .getMany();
 
       for (const recording of recordings) {
-        const meeting = await this.meetingRepo.findOne({ where: { id: recording.meetingId } });
+        const meeting = (await this.meetingRepo.findOne({ where: { id: recording.meetingId } })) || undefined;
         targets.push({
           zoomRecordingId: recording.zoomRecordingId,
           recording,
