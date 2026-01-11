@@ -22,15 +22,6 @@ export interface RetryResult {
   reason: string;
   meetingId?: string;
   zoomMeetingId?: string;
-    const useOAuth = !webhookDownloadToken;
-    const makeAuth = async () => {
-      const token = webhookDownloadToken || (await this.zoomService.getAccessToken());
-      const sep = url.includes('?') ? '&' : '?';
-      const finalUrl = token && !useOAuth ? `${url}${sep}access_token=${token}` : url;
-      const headers: Record<string, string> = {};
-      if (useOAuth && token) headers.Authorization = `Bearer ${token}`;
-      return { finalUrl, headers };
-    };
   courseIdMoodle?: number;
   driveUrl?: string;
   moodlePostId?: number;
@@ -425,22 +416,26 @@ export class RecordingsService {
     recording?: Recording;
     meeting?: Meeting;
   }>> {
-      const useOAuth = !webhookDownloadToken;
-      const token = webhookDownloadToken ?? (await this.zoomService.getAccessToken());
-      const finalUrl = !token || useOAuth ? url : `${url}${url.includes('?') ? '&' : '?'}access_token=${token}`;
-      const headers: Record<string, string> = {};
-      if (useOAuth && token) headers.Authorization = `Bearer ${token}`;
+    const targets: Array<{
+      zoomRecordingId?: string;
+      meetingId?: string;
+      zoomMeetingId?: string;
+      courseIdMoodle?: number;
+      topic?: string;
+      recording?: Recording;
+      meeting?: Meeting;
+    }> = [];
 
-      const res = await axios.head(finalUrl, {
+    if (dto.zoomRecordingId) {
       // Single recording by zoomRecordingId
       const recording = await this.recRepo.findOne({
         where: { zoomRecordingId: dto.zoomRecordingId },
-        relations: ['meeting'], // if you have relations set up
+        relations: ['meeting'],
       });
 
       let meeting: Meeting | undefined;
       if (recording?.meetingId) {
-        meeting = await this.meetingRepo.findOne({ where: { id: recording.meetingId } }) || undefined;
+        meeting = (await this.meetingRepo.findOne({ where: { id: recording.meetingId } })) || undefined;
       }
 
       targets.push({
