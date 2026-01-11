@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import * as https from 'https';
 import * as http from 'http';
 import { createHash } from 'crypto';
+import { pipeline } from 'stream/promises';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DeepPartial } from 'typeorm';
 import { DriveService } from '../drive/drive.service';
@@ -55,6 +56,10 @@ export class RecordingsService {
   private readonly retryGuard = new Map<string, Promise<any>>();
   // FIX #4: Lock por filepath para serializar operaciones sobre el mismo archivo
   private readonly fileLocks = new Map<string, Promise<void>>();
+  // Ruta absoluta para descargas, compatible con Docker
+  private readonly DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || '/app/downloads';
+  // Límite de concurrencia para subidas a Drive
+  private readonly uploadSemaphore = this.createSemaphore(3);
 
   // Config defaults (overridable via env)
   private readonly MAX_RETRIES_DOWNLOAD = this.getIntEnv('MAX_RETRIES_DOWNLOAD', 10);
@@ -65,7 +70,7 @@ export class RecordingsService {
   private readonly DRIVE_UPLOAD_TIMEOUT_MS = this.getIntEnv('DRIVE_UPLOAD_TIMEOUT_MS', 0);
   private readonly MIN_EXPECTED_SIZE_MB = this.getIntEnv('MIN_EXPECTED_SIZE_MB', 1);
   // Espera antes de publicar en Moodle para dar tiempo al preview de Drive (ms)
-  private readonly PREPUBLISH_DELAY_MS = this.getIntEnv('PREPUBLISH_DELAY_MS', 900000);
+  private readonly PREPUBLISH_DELAY_MS = this.getIntEnv('PREPUBLISH_DELAY_MS', 30000);
 
   constructor(
     @InjectRepository(Recording)
@@ -97,47 +102,41 @@ export class RecordingsService {
     }
 
     // Prevent concurrent processing for the same meeting (Zoom can send duplicates)
-    if (zoomMeetingId && this.inFlightMeetings.has(zoomMeetingId)) {
+    if (this.inFlightMeetings.has(zoomMeetingId)) {
       this.logger.warn(`Otro proceso ya está manejando meetingId=${zoomMeetingId}. Se ignora este evento (in-flight).`);
       return { status: 'in-flight' };
     }
-    if (zoomMeetingId) this.inFlightMeetings.add(zoomMeetingId);
+    this.inFlightMeetings.add(zoomMeetingId);
+    this.logger.log(`inflight:acquire meetingId=${zoomMeetingId}`);
 
-    // Map Zoom meeting to our Meeting entity; if missing (e.g., created via Moodle LTI), try to infer by topic and create it
-    let meeting: Meeting | null = await this.meetingRepo.findOne({ where: { zoomMeetingId } });
-    if (!meeting) {
-      this.logger.warn(`No se encontró Meeting para zoomMeetingId=${zoomMeetingId}. Intentando mapear por topic a curso Moodle (LTI)…`);
-      try {
+    try {
+      // Map Zoom meeting to our Meeting entity; if missing (e.g., created via Moodle LTI), try to infer by topic and create it
+      let meeting: Meeting | null = await this.meetingRepo.findOne({ where: { zoomMeetingId } });
+      if (!meeting) {
+        this.logger.warn(`No se encontró Meeting para zoomMeetingId=${zoomMeetingId}. Intentando mapear por topic a curso Moodle (LTI)…`);
         const inferred = await this.resolveExternalMeetingFromTopic(zoomMeetingId, topic);
         if (!inferred) {
           this.logger.warn(`No se pudo inferir curso desde topic="${topic}". Evento ignorado.`);
-          if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
           return { status: 'ignored' };
         }
         meeting = inferred;
         this.logger.log(`Meeting creado por LTI: id=${meeting!.id}, courseIdMoodle=${meeting!.courseIdMoodle}`);
-      } catch (e: any) {
-        this.logger.warn(`Fallo al crear Meeting desde topic: ${e?.message || e}`);
-        if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
+      } else {
+        this.logger.log(`Meeting encontrado: id=${meeting.id}, courseIdMoodle=${meeting.courseIdMoodle}`);
+      }
+
+      // Seleccionar el archivo MP4 preferentemente con estado "completed"; fallback a cualquier MP4 con URL
+      const mp4 =
+        files.find((f: any) => f.file_type === 'MP4' && f.download_url && (f.status === 'completed' || f.recording_status === 'completed')) ||
+        files.find((f: any) => f.file_type === 'MP4' && f.download_url);
+      if (!mp4) {
+        this.logger.warn('No hay archivo MP4 en la grabación');
         return { status: 'ignored' };
       }
-    } else {
-      this.logger.log(`Meeting encontrado: id=${meeting.id}, courseIdMoodle=${meeting.courseIdMoodle}`);
-    }
 
-    // Seleccionar el archivo MP4 preferentemente con estado "completed"; fallback a cualquier MP4 con URL
-    const mp4 =
-      files.find((f: any) => f.file_type === 'MP4' && f.download_url && (f.status === 'completed' || f.recording_status === 'completed')) ||
-      files.find((f: any) => f.file_type === 'MP4' && f.download_url);
-    if (!mp4) {
-      this.logger.warn('No hay archivo MP4 en la grabación');
-      return { status: 'ignored' };
-    }
+      const zoomRecordingId: string = String(mp4.id || mp4.file_id || mp4.recording_start || 'unknown');
+      const expectedBytes: number | undefined = typeof mp4.file_size === 'number' ? mp4.file_size : undefined;
 
-    const zoomRecordingId: string = String(mp4.id || mp4.file_id || mp4.recording_start || 'unknown');
-    const expectedBytes: number | undefined = typeof mp4.file_size === 'number' ? mp4.file_size : undefined;
-
-    try {
       // Idempotency: if already processed locally or in Drive, exit gracefully
       const existing = await this.recRepo.findOne({ where: { zoomRecordingId } });
       if (existing) {
@@ -160,7 +159,7 @@ export class RecordingsService {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const sanitizedTopic = (topic || 'Clase').replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 50);
       const filename = `${sanitizedTopic}_${timestamp}_${zoomRecordingId}.mp4`;
-      const localPath = path.join(process.cwd(), 'downloads', filename);
+      const localPath = path.join(this.DOWNLOADS_DIR, filename);
 
       return await this.withFileLock(localPath, async () => {
         await this.ensureDownloadDir();
@@ -179,7 +178,7 @@ export class RecordingsService {
             this.logger.warn(`HEAD size difiere de payload: head=${headInfo.contentLength} payload=${expectedBytes}`);
           }
 
-          const info = await this.downloadZoomRecording(mp4.download_url, localPath, tokenForThisAttempt);
+          const info = await this.downloadZoomRecording(mp4.download_url, localPath, tokenForThisAttempt, expectedBytes);
           const ok = await this.validateDownloadedFile(localPath, expectedBytes, info.contentType);
           if (!ok) {
             try { fs.unlinkSync(localPath); } catch { }
@@ -192,18 +191,17 @@ export class RecordingsService {
 
         // 2) Upload to Drive into course folder + yyyy-mm
         const courseFolderCode = String(meeting!.courseIdMoodle);
-        const rootDrive = process.env.GDRIVE_SHARED_DRIVE_ID ?? '';
-        const courseFolderId = await this.driveService.ensureFolder(courseFolderCode, rootDrive);
+        const courseFolderId = await this.ensureCourseFolder(meeting!.courseIdMoodle!);
         this.logger.log(`Carpeta curso en Drive: ${courseFolderCode} -> ${courseFolderId}`);
         const monthFolderId = await this.driveService.ensureFolder(new Date().toISOString().slice(0, 7), courseFolderId);
         const upStartedAt = Date.now();
         const upload = await this.withRobustRetries('upload', async (attempt) => {
-          const res = await this.driveService.uploadFile(localPath, filename, monthFolderId, {
+          const res = await this.uploadSemaphore.run(() => this.driveService.uploadFile(localPath, filename, monthFolderId, {
             meetingId: meeting!.id,
             courseIdMoodle: meeting!.courseIdMoodle!,
             zoomRecordingId,
             timeoutMs: this.DRIVE_UPLOAD_TIMEOUT_MS,
-          });
+          }));
           const localMd5 = await this.md5File(localPath);
           if (res.md5Checksum && res.md5Checksum !== localMd5) {
             this.logger.warn(`MD5 mismatch: drive=${res.md5Checksum} local=${localMd5}`);
@@ -219,7 +217,22 @@ export class RecordingsService {
         });
         const driveLink = upload.webViewLink;
         const upMs = Date.now() - upStartedAt;
-        this.logger.log(`Archivo subido a Drive: ${driveLink} | md5=${upload.md5Checksum || upload.localMd5} | ${Math.round(upMs / 1000)}s`);
+        this.logger.log(`upload:done meetingId=${meeting!.id} recordingId=${zoomRecordingId} fileId=${upload.fileId} md5=${upload.md5Checksum || upload.localMd5} size=${finalDownloadSize} duration=${Math.round(upMs / 1000)}s`);
+
+        try {
+          const post = await this.driveService.verifyPostUpload(
+            upload.fileId,
+            upload.localMd5,
+            finalDownloadSize,
+          );
+          this.logger.log(
+            `drive:post-upload-status fileId=${upload.fileId} exists=${post.exists} md5=${post.md5Validated} size=${post.sizeValidated} processed=${post.processed} thumbnail=${post.hasThumbnail}`,
+          );
+        } catch (e: any) {
+          this.logger.warn(`drive:post-upload-check-failed fileId=${upload.fileId} err=${e?.message || e}`);
+        }
+
+        await this.waitForDrivePreview(upload.fileId).catch(() => undefined);
 
         // Esperar para que el reproductor de Drive esté listo
         if (this.PREPUBLISH_DELAY_MS > 0) {
@@ -256,7 +269,10 @@ export class RecordingsService {
         return { status: 'done', driveUrl: driveLink };
       });
     } finally {
-      if (zoomMeetingId) this.inFlightMeetings.delete(zoomMeetingId);
+      if (zoomMeetingId) {
+        this.inFlightMeetings.delete(zoomMeetingId);
+        this.logger.log(`inflight:release meetingId=${zoomMeetingId}`);
+      }
     }
   }
 
@@ -739,25 +755,38 @@ export class RecordingsService {
       }
 
       const filename = `${zoomMeetingId}_${mp4File.id}.mp4`;
-      const downloadPath = path.join(process.cwd(), 'downloads', filename);
+      const downloadPath = path.join(this.DOWNLOADS_DIR, filename);
 
-      try {
-        // Descargar desde Zoom usando la URL de descarga (S2S OAuth)
-        await this.downloadZoomRecording(mp4File.download_url, downloadPath);
-        // Validar archivo descargado (tamaño y tipo)
-        const valid = await this.validateDownloadedFile(downloadPath, mp4File.file_size);
+      await this.ensureDownloadDir();
+
+      return await this.withFileLock(downloadPath, async () => {
+        this.logger.log(`download:start meetingId=${meeting.id} recordingId=${mp4File.id} path=${downloadPath}`);
+
+        const { contentType } = await this.downloadZoomRecording(mp4File.download_url, downloadPath, undefined, mp4File.file_size);
+
+        const postDownloadStat = await fs.promises.stat(downloadPath).catch(() => null as any);
+        if (!postDownloadStat || postDownloadStat.size === 0) {
+          throw new Error(`download-empty meetingId=${meeting.id} recordingId=${mp4File.id} path=${downloadPath} url=${mp4File.download_url}`);
+        }
+        this.logger.log(`download:done meetingId=${meeting.id} recordingId=${mp4File.id} size=${postDownloadStat.size}`);
+
+        const valid = await this.validateDownloadedFile(downloadPath, mp4File.file_size, contentType);
         if (!valid) {
+          await fs.promises.unlink(downloadPath).catch(() => undefined);
           throw new Error('Downloaded file failed validation (size/type)');
         }
 
+        const statBeforeUpload = await fs.promises.stat(downloadPath);
+        this.logger.log(`upload:start meetingId=${meeting.id} recordingId=${mp4File.id} size=${statBeforeUpload.size}`);
+
         // Resolver carpetas en Drive: curso y YYYY-MM
         const courseFolderCode = String(courseIdMoodle);
-        const courseFolderId = await this.driveService.ensureFolder(courseFolderCode);
+        const courseFolderId = await this.ensureCourseFolder(courseIdMoodle);
         const monthFolderName = new Date().toISOString().slice(0, 7);
         const monthFolderId = await this.driveService.ensureFolder(monthFolderName, courseFolderId);
 
         // Subir a Drive al folder del mes
-        const uploadResult = await this.driveService.uploadFile(
+        const uploadResult = await this.uploadSemaphore.run(() => this.driveService.uploadFile(
           downloadPath,
           filename,
           monthFolderId,
@@ -767,10 +796,40 @@ export class RecordingsService {
             zoomRecordingId: String(mp4File.id),
             timeoutMs: this.DRIVE_UPLOAD_TIMEOUT_MS,
           }
-        );
+        ));
+
+        const localMd5 = await this.md5File(downloadPath);
+        if (uploadResult.md5Checksum && uploadResult.md5Checksum !== localMd5) {
+          throw new Error(`MD5 mismatch after upload drive=${uploadResult.md5Checksum} local=${localMd5}`);
+        }
+        if (!uploadResult.md5Checksum) {
+          throw new Error('Drive no devolvió md5Checksum (posible carga incompleta)');
+        }
+        const localStat = await fs.promises.stat(downloadPath);
+        if (uploadResult.sizeBytes && Math.abs(uploadResult.sizeBytes - localStat.size) > 1024) {
+          throw new Error(`Tamaño en Drive (${uploadResult.sizeBytes}) difiere del local (${localStat.size})`);
+        }
+
+        try {
+          const post = await this.driveService.verifyPostUpload(
+            uploadResult.fileId,
+            localMd5,
+            localStat.size,
+          );
+          this.logger.log(
+            `drive:post-upload-status fileId=${uploadResult.fileId} exists=${post.exists} md5=${post.md5Validated} size=${post.sizeValidated} processed=${post.processed} thumbnail=${post.hasThumbnail}`,
+          );
+        } catch (e: any) {
+          this.logger.warn(`drive:post-upload-check-failed fileId=${uploadResult.fileId} err=${e?.message || e}`);
+        }
+
+        await this.waitForDrivePreview(uploadResult.fileId).catch(() => undefined);
+
+        this.logger.log(`upload:done meetingId=${meeting.id} recordingId=${mp4File.id} fileId=${uploadResult.fileId} md5=${uploadResult.md5Checksum}`);
 
         // Publicar en Moodle
         const forumId = await this.moodleService.getRecordedForumId(courseIdMoodle);
+        this.logger.log(`moodle:start meetingId=${meeting.id} recordingId=${mp4File.id} forumId=${forumId}`);
         const previewLink2 = uploadResult.webViewLink.replace('/view', '/preview');
         const iframe2 = `<div style="max-width: 720px; width: 80vw; margin: 20px auto;"><div style="position: relative; width: 100%; padding-top: 56.25%;"><iframe style="position: absolute; inset: 0; width: 100%; height: 100%; border: 0;" src="${previewLink2}" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe><div style="position: absolute; top: 8px; right: 8px; width: 72px; height: 72px; z-index: 3; background: transparent; cursor: not-allowed;" title="Pop-out deshabilitado" aria-label="Pop-out deshabilitado"></div></div></div>`;
         const moodleResult = await this.moodleService.addForumDiscussion(
@@ -778,6 +837,7 @@ export class RecordingsService {
           `Grabación disponible: ${meeting.topic}`,
           iframe2
         );
+        this.logger.log(`moodle:done meetingId=${meeting.id} recordingId=${mp4File.id} discussionId=${moodleResult.discussionid}`);
 
         // Crear o actualizar recording
         let recording = target.recording || target;
@@ -795,6 +855,9 @@ export class RecordingsService {
 
         this.logger.log(`Full mode completed for zoomMeetingId ${zoomMeetingId}: Drive=${uploadResult.fileId}, Moodle=${moodleResult.discussionid}`);
 
+        await fs.promises.unlink(downloadPath).catch(() => undefined);
+        this.logger.debug(`Cleaned up temporary file: ${downloadPath}`);
+
         return {
           selector,
           mode: 'full',
@@ -804,21 +867,14 @@ export class RecordingsService {
           driveUrl: uploadResult.webViewLink,
           moodlePostId: moodleResult.discussionid,
           integrity: {
-            localMd5: await this.md5File(downloadPath),
+            localMd5,
             driveMd5: uploadResult.md5Checksum,
             sizeBytes: mp4File.file_size,
           },
           meetingId: meeting.id,
           zoomMeetingId,
         };
-
-      } finally {
-        // Limpiar archivo temporal
-        if (fs.existsSync(downloadPath)) {
-          fs.unlinkSync(downloadPath);
-          this.logger.debug(`Cleaned up temporary file: ${downloadPath}`);
-        }
-      }
+      });
 
     } catch (error) {
       this.logger.error(`Full mode failed for selector ${JSON.stringify(selector)}:`, error);
@@ -866,10 +922,29 @@ export class RecordingsService {
   }
 
   private async ensureDownloadDir() {
-    const dir = path.join(process.cwd(), 'downloads');
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    await fs.promises.mkdir(this.DOWNLOADS_DIR, { recursive: true });
+  }
+
+  private async ensureCourseFolder(courseIdMoodle: number): Promise<string> {
+    const rootDrive = process.env.GDRIVE_SHARED_DRIVE_ID ?? '';
+    return this.driveService.ensureFolder(String(courseIdMoodle), rootDrive);
+  }
+
+  private async waitForDrivePreview(fileId: string, maxWaitMs = 120000, intervalMs = 10000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+      try {
+        const meta = await this.driveService.getFileMetadata(fileId);
+        if (meta?.thumbnailLink || meta?.videoMediaMetadata) {
+          this.logger.log(`drive:preview-ready fileId=${fileId}`);
+          return;
+        }
+      } catch (e) {
+        this.logger.warn(`drive:preview-check failed fileId=${fileId} err=${(e as any)?.message || e}`);
+      }
+      await this.sleep(intervalMs);
     }
+    this.logger.warn(`drive:preview-timeout fileId=${fileId}`);
   }
 
   private async warmupHead(url: string, webhookDownloadToken?: string): Promise<{ contentLength?: number; contentType?: string } | null> {
@@ -925,6 +1000,7 @@ export class RecordingsService {
     url: string,
     filePath: string,
     webhookDownloadToken?: string,
+    expectedBytes?: number,
   ): Promise<{ contentType?: string; contentLength?: number }> {
     const useWebhookToken = Boolean(webhookDownloadToken);
     let oauthToken: string | undefined;
@@ -955,52 +1031,64 @@ export class RecordingsService {
       } catch { }
     }
 
-    // Prepare request headers
-    const headers: Record<string, string> = { Accept: 'video/mp4, application/octet-stream' };
-    if (startByte > 0) headers['Range'] = `bytes=${startByte}-`;
-    if (!useWebhookToken && oauthToken) headers['Authorization'] = `Bearer ${oauthToken}`;
+    const buildHeaders = (rangeFrom?: number): Record<string, string> => {
+      const headers: Record<string, string> = { Accept: 'video/mp4, application/octet-stream' };
+      if (rangeFrom && rangeFrom > 0) headers['Range'] = `bytes=${rangeFrom}-`;
+      if (!useWebhookToken && oauthToken) headers['Authorization'] = `Bearer ${oauthToken}`;
+      return headers;
+    };
 
-    const res = await axios.get(finalUrl, {
-      responseType: 'stream',
-      headers,
-      timeout: this.DOWNLOAD_TIMEOUT_MS || 0,
-      maxContentLength: Infinity as any,
-      httpAgent: new http.Agent({ keepAlive: true }),
-      httpsAgent: new https.Agent({ keepAlive: true }),
-      validateStatus: () => true,
-    });
-
-    if (!useWebhookToken && [401, 403].includes(res.status)) {
-      // Retry once with refreshed OAuth token (Authorization header)
-      const refreshed = await this.zoomService.getAccessToken();
-      const retryHeaders = {
-        ...headers,
-        Authorization: `Bearer ${refreshed}`,
-      } as Record<string, string>;
-      finalUrl = url;
-      const res2 = await axios.get(finalUrl, {
+    const makeRequest = async (rangeFrom: number): Promise<AxiosResponse<any>> => {
+      const headers = buildHeaders(rangeFrom);
+      return axios.get(finalUrl, {
         responseType: 'stream',
-        headers: retryHeaders,
+        headers,
         timeout: this.DOWNLOAD_TIMEOUT_MS || 0,
+        maxContentLength: Infinity as any,
         httpAgent: new http.Agent({ keepAlive: true }),
         httpsAgent: new https.Agent({ keepAlive: true }),
         validateStatus: () => true,
       });
-      return await this.handleDownloadResponse(res2, filePath, flags);
+    };
+
+    let res = await makeRequest(startByte);
+    this.logger.log(`download:status file=${filePath} status=${res.status} rangeStart=${startByte}`);
+
+    if (!useWebhookToken && [401, 403].includes(res.status)) {
+      // Retry once with refreshed OAuth token (Authorization header)
+      const refreshed = await this.zoomService.getAccessToken();
+      oauthToken = refreshed;
+      res = await makeRequest(startByte);
+      this.logger.log(`download:status-refreshed file=${filePath} status=${res.status} rangeStart=${startByte}`);
     }
 
-    return await this.handleDownloadResponse(res, filePath, flags);
+    if (startByte > 0 && res.status === 200) {
+      this.logger.warn(`download:range-ignored restart-from-0 file=${filePath}`);
+      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch { }
+      startByte = 0;
+      flags = 'w';
+      res = await makeRequest(0);
+      this.logger.log(`download:restart file=${filePath} status=${res.status} rangeStart=0`);
+    }
+
+    return await this.handleDownloadResponse(res, filePath, flags, startByte, expectedBytes);
   }
 
   private async handleDownloadResponse(
     res: AxiosResponse<any>,
     filePath: string,
     flags: 'a' | 'w',
+    startByte: number,
+    expectedBytes?: number,
   ): Promise<{ contentType?: string; contentLength?: number }> {
     const status = res.status;
     if (status === 206) this.logger.log('Reanudando descarga (206 Partial Content)');
     if (status === 416) {
-      // Rango inválido: reiniciar desde cero en el siguiente intento
+      const st = fs.existsSync(filePath) ? fs.statSync(filePath) : null;
+      if (expectedBytes && st && st.size >= expectedBytes) {
+        this.logger.warn(`download:416 but local >= expected (${st.size}/${expectedBytes})`);
+        return { contentType: String(res.headers['content-type'] || '') || undefined, contentLength: expectedBytes };
+      }
       try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch { }
       throw new Error('Descarga fallo status=416');
     }
@@ -1011,14 +1099,17 @@ export class RecordingsService {
     const contentType = String(res.headers['content-type'] || '') || undefined;
     const contentLength = Number(res.headers['content-length'] || 0) || undefined;
 
-    await new Promise<void>((resolve, reject) => {
-      const ws = fs.createWriteStream(filePath, { flags });
-      res.data.pipe(ws);
-      // FIX: Usar 'close' en lugar de 'finish' para asegurar que el archivo
-      // esté completamente escrito en disco (no solo en buffer del OS)
-      ws.on('close', resolve);
-      ws.on('error', reject);
-    });
+    const writeFlag: 'a' | 'w' = status === 206 ? flags : 'w';
+    if (writeFlag === 'a' && status !== 206) {
+      this.logger.warn('download:append-blocked status!=206, writing fresh');
+    }
+    if (status === 200 && startByte > 0 && writeFlag === 'a') {
+      // Safety: never append on full response
+      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch { }
+    }
+
+    const ws = fs.createWriteStream(filePath, { flags: writeFlag });
+    await pipeline(res.data, ws);
 
     return { contentType, contentLength };
   }
@@ -1111,5 +1202,33 @@ export class RecordingsService {
       releaseLock();
       this.fileLocks.delete(filePath);
     }
+  }
+
+  private createSemaphore(max: number) {
+    let active = 0;
+    const queue: Array<() => void> = [];
+    const acquire = async () => {
+      if (active < max) {
+        active += 1;
+        return;
+      }
+      await new Promise<void>((resolve) => queue.push(resolve));
+      active += 1;
+    };
+    const release = () => {
+      active = Math.max(0, active - 1);
+      const next = queue.shift();
+      if (next) next();
+    };
+    return {
+      run: async <T>(fn: () => Promise<T>): Promise<T> => {
+        await acquire();
+        try {
+          return await fn();
+        } finally {
+          release();
+        }
+      },
+    };
   }
 }

@@ -110,6 +110,8 @@ export class DriveService implements OnModuleInit {
 
     // 2) Enviar chunks con PUT y Content-Range
     let offset = 0;
+    let lastRes: any;
+    let noRange308Count = 0;
     while (offset < total) {
       const end = Math.min(offset + chunkSize, total) - 1;
       const contentLength = end - offset + 1;
@@ -133,6 +135,7 @@ export class DriveService implements OnModuleInit {
           validateStatus: () => true,
         });
       });
+      lastRes = res;
 
       if (res.status === 308) {
         // Resume Incomplete; avanzar según Range
@@ -140,8 +143,13 @@ export class DriveService implements OnModuleInit {
         if (range) {
           const m = /bytes=\d+-(\d+)/.exec(range);
           if (m) offset = parseInt(m[1], 10) + 1; else offset = end + 1;
+          noRange308Count = 0;
         } else {
-          offset = end + 1;
+          noRange308Count += 1;
+          this.logger.warn(`upload:308-without-range retry=${noRange308Count}`);
+          if (noRange308Count >= 5) {
+            throw new Error('Drive stuck returning 308 without Range');
+          }
         }
         this.logger.log(`Subiendo a Drive… offset=${offset}/${total}`);
         continue;
@@ -155,28 +163,24 @@ export class DriveService implements OnModuleInit {
       throw new Error(`Resumable upload fallo status=${res.status}`);
     }
 
-    // 3) Obtener metadata (md5Checksum/webViewLink)
-    const query = await this.drive.files.list({
-      q: `name='${filename}' and '${folderId}' in parents and trashed=false`,
-      corpora: 'drive',
-      driveId: this.sharedDriveId,
-      includeItemsFromAllDrives: true,
-      supportsAllDrives: true,
-      fields: 'files(id, webViewLink, md5Checksum)',
-    });
-    const file = query.data.files?.[0];
-    if (!file?.id) throw new Error('No se encontró archivo tras upload');
+    if (!lastRes || !lastRes.data || !lastRes.data.id) {
+      throw new Error('No se obtuvo metadata del archivo tras upload');
+    }
+    const fileId = String(lastRes.data.id);
+    let webViewLink = lastRes.data.webViewLink as string | undefined;
+    let remoteMd5 = lastRes.data.md5Checksum as string | undefined;
+    let remoteSize = lastRes.data.size ? Number(lastRes.data.size) : undefined;
 
-    const fileId = file.id;
-
-    // 4) Obtener metadata completa para validar integridad (size + md5)
-    const meta = await this.drive.files.get({
-      fileId,
-      fields: 'id, webViewLink, md5Checksum, size',
-      supportsAllDrives: true,
-    });
-    const remoteMd5 = meta.data.md5Checksum || file.md5Checksum || undefined;
-    const remoteSize = meta.data.size ? Number(meta.data.size) : undefined;
+    if (!webViewLink || !remoteMd5 || remoteSize === undefined) {
+      const meta = await this.drive.files.get({
+        fileId,
+        fields: 'id, webViewLink, md5Checksum, size',
+        supportsAllDrives: true,
+      });
+      webViewLink = webViewLink || meta.data.webViewLink || undefined;
+      remoteMd5 = remoteMd5 || meta.data.md5Checksum || undefined;
+      remoteSize = remoteSize ?? (meta.data.size ? Number(meta.data.size) : undefined);
+    }
 
     // 5) Permisos: anyone with link (reader) + restricción de descarga
     try {
@@ -197,8 +201,57 @@ export class DriveService implements OnModuleInit {
       this.logger.warn(`No se pudo configurar permisos del archivo: ${fileId} -> ${String((e as any)?.message || e)}`);
     }
 
+    if (!webViewLink) {
+      throw new Error('No se obtuvo webViewLink del archivo subido');
+    }
     this.logger.log(`Archivo subido a Drive (ID=${fileId})`);
-    return { fileId, webViewLink: meta.data.webViewLink || file.webViewLink!, md5Checksum: remoteMd5, sizeBytes: remoteSize };
+    return { fileId, webViewLink, md5Checksum: remoteMd5, sizeBytes: remoteSize };
+  }
+
+  async getFileMetadata(fileId: string): Promise<{ thumbnailLink?: string; videoMediaMetadata?: { processingStatus?: 'processing' | 'ready' | 'failed' }; md5Checksum?: string; size?: number }> {
+    const res = await this.drive.files.get({
+      fileId,
+      fields: 'id, thumbnailLink, videoMediaMetadata, md5Checksum, size',
+      supportsAllDrives: true,
+    });
+    const vmm = res.data.videoMediaMetadata as { processingStatus?: 'processing' | 'ready' | 'failed' } | undefined;
+    return {
+      thumbnailLink: res.data.thumbnailLink || undefined,
+      videoMediaMetadata: vmm,
+      md5Checksum: res.data.md5Checksum || undefined,
+      size: res.data.size ? Number(res.data.size) : undefined,
+    };
+  }
+
+  async verifyPostUpload(
+    fileId: string,
+    expectedMd5?: string,
+    expectedSize?: number,
+  ): Promise<{ exists: boolean; md5Validated: boolean; sizeValidated: boolean; processed: boolean; hasThumbnail: boolean }> {
+    const res = await this.drive.files.get({
+      fileId,
+      fields: 'id, md5Checksum, size, thumbnailLink, videoMediaMetadata',
+      supportsAllDrives: true,
+    });
+
+    const remoteMd5 = res.data.md5Checksum;
+    const remoteSize = res.data.size ? Number(res.data.size) : undefined;
+    const vmm = res.data.videoMediaMetadata as { processingStatus?: 'processing' | 'ready' | 'failed' } | undefined;
+    const processed = vmm?.processingStatus === 'ready';
+    const hasThumbnail = Boolean(res.data.thumbnailLink);
+
+    const sizeValidated = Boolean(
+      typeof expectedSize === 'number' && typeof remoteSize === 'number' && Math.abs(remoteSize - expectedSize) <= 1024,
+    );
+    const md5Validated = Boolean(expectedMd5 && remoteMd5 && remoteMd5 === expectedMd5);
+
+    return {
+      exists: true,
+      md5Validated,
+      sizeValidated,
+      processed,
+      hasThumbnail,
+    };
   }
 
   /** Busca por appProperties.zoomRecordingId en el Shared Drive */
@@ -219,7 +272,7 @@ export class DriveService implements OnModuleInit {
 
   private async startResumableSession(args: { name: string; parents: string[]; appProperties: Record<string, string>; mimeType: string; size: number; timeout?: number }): Promise<string> {
     // Build URL
-    const url = `https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true`;
+    const url = `https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true&fields=id,webViewLink,md5Checksum,size`;
     const token = await this.getAccessToken();
     const headers = {
       Authorization: `Bearer ${token}`,
