@@ -6,6 +6,8 @@ services:
       context: ./backend
     env_file:
       - ./backend/.env
+    environment:
+      - TZ=America/Lima
     ports:
       - "8091:3000"
     volumes:

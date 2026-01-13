@@ -156,7 +156,7 @@ export class RecordingsService {
       }
 
       // 1) Preparar filepath único y serializar operaciones sobre el mismo archivo
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const timestamp = this.getLocalTimestamp();
       const sanitizedTopic = (topic || 'Clase').replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 50);
       const filename = `${sanitizedTopic}_${timestamp}_${zoomRecordingId}.mp4`;
       const localPath = path.join(this.DOWNLOADS_DIR, filename);
@@ -1170,6 +1170,26 @@ export class RecordingsService {
 
   private sleep(ms: number) {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  /**
+   * Genera un timestamp en zona horaria de Lima/Perú (America/Lima) para nombres de archivo.
+   * Formato: 2026-01-13_11-23-59 (sin milisegundos, legible)
+   */
+  private getLocalTimestamp(): string {
+    const now = new Date();
+    const limaDate = now.toLocaleString('sv-SE', {
+      timeZone: 'America/Lima',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+    // Formato sv-SE: "2026-01-13 11:23:59" -> convertir a "2026-01-13_11-23-59"
+    return limaDate.replace(' ', '_').replace(/:/g, '-');
   }
 
   private getIntEnv(key: string, def: number): number {
