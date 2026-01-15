@@ -184,19 +184,42 @@ export class DriveService implements OnModuleInit {
 
     // 5) Permisos: anyone with link (reader) + restricción de descarga
     try {
-      await this.drive.permissions.create({
-        fileId,
-        requestBody: { role: 'reader', type: 'anyone' },
-        supportsAllDrives: true,
-      });
-      
-      await this.drive.files.update({
-        fileId,
-        requestBody: { copyRequiresWriterPermission: true },
-        supportsAllDrives: true,
-      });
-      
-      this.logger.log(`Permisos actualizados: anyone with link (reader) + sin descarga`);
+      const applyPermissionsWithRetry = async (): Promise<boolean> => {
+        const maxAttempts = 5;
+        const baseDelayMs = 2000;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            await this.drive.permissions.create({
+              fileId,
+              requestBody: { role: 'reader', type: 'anyone' },
+              supportsAllDrives: true,
+            });
+            return true;
+          } catch (e) {
+            const delay = Math.min(30000, baseDelayMs * Math.pow(2, attempt - 1));
+            const msg = String((e as any)?.message || e);
+            if (attempt >= maxAttempts) {
+              this.logger.warn(`Permisos create agotó retries para fileId=${fileId}: ${msg}`);
+              return false;
+            }
+            this.logger.warn(`Permisos create retry attempt=${attempt}/${maxAttempts} fileId=${fileId} err=${msg} nextInMs=${delay}`);
+            await new Promise((r) => setTimeout(r, delay));
+          }
+        }
+        return false;
+      };
+
+      const permissionApplied = await applyPermissionsWithRetry();
+
+      if (permissionApplied) {
+        await this.drive.files.update({
+          fileId,
+          requestBody: { copyRequiresWriterPermission: true },
+          supportsAllDrives: true,
+        });
+        
+        this.logger.log(`Permisos actualizados: anyone with link (reader) + sin descarga`);
+      }
     } catch (e) {
       this.logger.warn(`No se pudo configurar permisos del archivo: ${fileId} -> ${String((e as any)?.message || e)}`);
     }
@@ -221,6 +244,82 @@ export class DriveService implements OnModuleInit {
       md5Checksum: res.data.md5Checksum || undefined,
       size: res.data.size ? Number(res.data.size) : undefined,
     };
+  }
+
+  /**
+   * Toca el preview para que Drive arranque su procesamiento de forma pasiva.
+   * Es equivalente a que un usuario abra la URL de preview.
+   */
+  async touchPreview(fileId: string): Promise<void> {
+    try {
+      await axios.head(`https://drive.google.com/file/d/${fileId}/preview`, {
+        timeout: 8000,
+        validateStatus: () => true,
+      });
+      this.logger.log(`drive:preview-touched fileId=${fileId}`);
+    } catch {
+      // Ignorar: solo es un toque pasivo, no debe bloquear
+    }
+  }
+
+  /**
+   * Espera activamente a que el video esté procesado, con polling más agresivo al inicio.
+   * Retorna true si el video está listo, false si hubo timeout.
+   */
+  async waitForVideoReady(
+    fileId: string,
+    maxWaitMs: number = 600000, // 10 minutos por defecto
+    onProgress?: (status: { elapsed: number; processed: boolean; hasThumbnail: boolean }) => void,
+  ): Promise<boolean> {
+    const start = Date.now();
+    let checkCount = 0;
+    
+    // Polling más frecuente al inicio (cada 5s los primeros 2 min), luego cada 15s
+    const getInterval = (elapsed: number) => elapsed < 120000 ? 5000 : 15000;
+
+    while (Date.now() - start < maxWaitMs) {
+      checkCount++;
+      try {
+        const res = await this.drive.files.get({
+          fileId,
+          fields: 'id, thumbnailLink, videoMediaMetadata',
+          supportsAllDrives: true,
+        });
+
+        const vmm = res.data.videoMediaMetadata as { processingStatus?: string } | undefined;
+        const processed = vmm?.processingStatus === 'ready';
+        const hasThumbnail = Boolean(res.data.thumbnailLink);
+        const elapsed = Date.now() - start;
+
+        if (onProgress) {
+          onProgress({ elapsed, processed, hasThumbnail });
+        }
+
+        // Video listo si tiene thumbnail O está procesado
+        if (processed || hasThumbnail) {
+          this.logger.log(`drive:video-ready fileId=${fileId} checks=${checkCount} elapsed=${Math.round(elapsed / 1000)}s processed=${processed} thumbnail=${hasThumbnail}`);
+          return true;
+        }
+
+        // Si el status es 'failed', no tiene sentido seguir esperando
+        // Significa que Drive no pudo transcodificar; el archivo sigue siendo descargable/publicable.
+        if (vmm?.processingStatus === 'failed') {
+          this.logger.error(`drive:video-processing-failed fileId=${fileId}`);
+          return false;
+        }
+
+        const interval = getInterval(elapsed);
+        this.logger.debug?.(`drive:video-pending fileId=${fileId} check=${checkCount} elapsed=${Math.round(elapsed / 1000)}s nextIn=${interval}ms`);
+        await new Promise(r => setTimeout(r, interval));
+
+      } catch (e) {
+        this.logger.warn(`drive:video-check-error fileId=${fileId} err=${(e as any)?.message || e}`);
+        await new Promise(r => setTimeout(r, 10000));
+      }
+    }
+
+    this.logger.warn(`drive:video-timeout fileId=${fileId} checks=${checkCount} maxWait=${maxWaitMs}ms`);
+    return false;
   }
 
   async verifyPostUpload(

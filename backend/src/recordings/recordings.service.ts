@@ -47,6 +47,13 @@ export interface RetryRequestDTO {
   limit?: number;
 }
 
+class RetryableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RetryableError';
+  }
+}
+
 @Injectable()
 export class RecordingsService {
   private readonly logger = new Logger(RecordingsService.name);
@@ -71,6 +78,8 @@ export class RecordingsService {
   private readonly MIN_EXPECTED_SIZE_MB = this.getIntEnv('MIN_EXPECTED_SIZE_MB', 1);
   // Espera antes de publicar en Moodle para dar tiempo al preview de Drive (ms)
   private readonly PREPUBLISH_DELAY_MS = this.getIntEnv('PREPUBLISH_DELAY_MS', 30000);
+  // Tiempo máximo de espera para que Drive procese el video (ms) - default 10 minutos
+  private readonly DRIVE_PROCESSING_TIMEOUT_MS = this.getIntEnv('DRIVE_PROCESSING_TIMEOUT_MS', 600000);
 
   constructor(
     @InjectRepository(Recording)
@@ -107,7 +116,7 @@ export class RecordingsService {
       return { status: 'in-flight' };
     }
     this.inFlightMeetings.add(zoomMeetingId);
-    this.logger.log(`inflight:acquire meetingId=${zoomMeetingId}`);
+    this.logger.log(`inflight:acquire meetingId=${zoomMeetingId} active=${this.inFlightMeetings.size}/unbounded`);
 
     try {
       // Map Zoom meeting to our Meeting entity; if missing (e.g., created via Moodle LTI), try to infer by topic and create it
@@ -169,10 +178,14 @@ export class RecordingsService {
         await this.withRobustRetries('download', async (attempt) => {
           const tokenForThisAttempt = attempt === 1 ? downloadToken : undefined;
 
+          if (!tokenForThisAttempt) {
+            await this.zoomService.ensureFreshToken();
+          }
+
           const headInfo = await this.warmupHead(mp4.download_url, tokenForThisAttempt);
           const minBytes = this.MIN_EXPECTED_SIZE_MB * 1024 * 1024;
           if (headInfo?.contentLength && headInfo.contentLength < minBytes) {
-            throw new Error(`Recording not ready (HEAD content-length=${headInfo.contentLength})`);
+            throw new RetryableError('Recording not ready yet (size too small) – waiting for Zoom processing');
           }
           if (headInfo && headInfo.contentLength && expectedBytes && Math.abs(headInfo.contentLength - expectedBytes) / expectedBytes > 0.01) {
             this.logger.warn(`HEAD size difiere de payload: head=${headInfo.contentLength} payload=${expectedBytes}`);
@@ -232,11 +245,30 @@ export class RecordingsService {
           this.logger.warn(`drive:post-upload-check-failed fileId=${upload.fileId} err=${e?.message || e}`);
         }
 
-        await this.waitForDrivePreview(upload.fileId).catch(() => undefined);
+        // Toque pasivo para que Drive comience a procesar el video
+        await this.driveService.touchPreview(upload.fileId);
 
-        // Esperar para que el reproductor de Drive esté listo
+        // Esperar a que el video esté procesado (con timeout configurable)
+        let lastLoggedMinute = -1;
+        const videoReady = await this.driveService.waitForVideoReady(
+          upload.fileId,
+          this.DRIVE_PROCESSING_TIMEOUT_MS,
+          (status) => {
+            const minute = Math.floor(status.elapsed / 60000);
+            if (minute !== lastLoggedMinute) {
+              lastLoggedMinute = minute;
+              this.logger.log(`drive:processing-wait fileId=${upload.fileId} elapsed=${Math.round(status.elapsed / 1000)}s processed=${status.processed} thumbnail=${status.hasThumbnail}`);
+            }
+          }
+        );
+
+        if (!videoReady) {
+          this.logger.warn(`drive:video-not-ready-yet fileId=${upload.fileId} - publicando de todas formas (se procesará eventualmente)`);
+        }
+
+        // Espera adicional configurable
         if (this.PREPUBLISH_DELAY_MS > 0) {
-          this.logger.log(`Esperando ${Math.round(this.PREPUBLISH_DELAY_MS / 1000)}s para que Drive procese el preview…`);
+          this.logger.log(`Esperando ${Math.round(this.PREPUBLISH_DELAY_MS / 1000)}s adicionales antes de publicar en Moodle…`);
           await this.sleep(this.PREPUBLISH_DELAY_MS);
         }
 
@@ -271,7 +303,7 @@ export class RecordingsService {
     } finally {
       if (zoomMeetingId) {
         this.inFlightMeetings.delete(zoomMeetingId);
-        this.logger.log(`inflight:release meetingId=${zoomMeetingId}`);
+        this.logger.log(`inflight:release meetingId=${zoomMeetingId} active=${this.inFlightMeetings.size}/unbounded`);
       }
     }
   }
@@ -823,7 +855,26 @@ export class RecordingsService {
           this.logger.warn(`drive:post-upload-check-failed fileId=${uploadResult.fileId} err=${e?.message || e}`);
         }
 
-        await this.waitForDrivePreview(uploadResult.fileId).catch(() => undefined);
+        // Toque pasivo para que Drive comience a procesar el video
+        await this.driveService.touchPreview(uploadResult.fileId);
+
+        // Esperar a que el video esté procesado
+        let lastLoggedMinute = -1;
+        const videoReady = await this.driveService.waitForVideoReady(
+          uploadResult.fileId,
+          this.DRIVE_PROCESSING_TIMEOUT_MS,
+          (status) => {
+            const minute = Math.floor(status.elapsed / 60000);
+            if (minute !== lastLoggedMinute) {
+              lastLoggedMinute = minute;
+              this.logger.log(`drive:processing-wait fileId=${uploadResult.fileId} elapsed=${Math.round(status.elapsed / 1000)}s processed=${status.processed} thumbnail=${status.hasThumbnail}`);
+            }
+          }
+        );
+
+        if (!videoReady) {
+          this.logger.warn(`drive:video-not-ready-yet fileId=${uploadResult.fileId} - publicando de todas formas`);
+        }
 
         this.logger.log(`upload:done meetingId=${meeting.id} recordingId=${mp4File.id} fileId=${uploadResult.fileId} md5=${uploadResult.md5Checksum}`);
 
@@ -930,26 +981,12 @@ export class RecordingsService {
     return this.driveService.ensureFolder(String(courseIdMoodle), rootDrive);
   }
 
-  private async waitForDrivePreview(fileId: string, maxWaitMs = 120000, intervalMs = 10000) {
-    const start = Date.now();
-    while (Date.now() - start < maxWaitMs) {
-      try {
-        const meta = await this.driveService.getFileMetadata(fileId);
-        if (meta?.thumbnailLink || meta?.videoMediaMetadata) {
-          this.logger.log(`drive:preview-ready fileId=${fileId}`);
-          return;
-        }
-      } catch (e) {
-        this.logger.warn(`drive:preview-check failed fileId=${fileId} err=${(e as any)?.message || e}`);
-      }
-      await this.sleep(intervalMs);
-    }
-    this.logger.warn(`drive:preview-timeout fileId=${fileId}`);
-  }
-
   private async warmupHead(url: string, webhookDownloadToken?: string): Promise<{ contentLength?: number; contentType?: string } | null> {
     try {
       const useOAuth = !webhookDownloadToken;
+      if (useOAuth) {
+        await this.zoomService.ensureFreshToken();
+      }
       const token = webhookDownloadToken || (await this.zoomService.getAccessToken());
       const sep = url.includes('?') ? '&' : '?';
       const finalUrl = token && !useOAuth ? `${url}${sep}access_token=${token}` : url;
@@ -966,6 +1003,9 @@ export class RecordingsService {
       if ([404, 409, 425].includes(res.status)) {
         this.logger.warn(`HEAD preliminar status=${res.status}. Reintentará tras espera.`);
         await this.sleep(30000);
+        if (useOAuth) {
+          await this.zoomService.ensureFreshToken();
+        }
         const res2 = await axios.head(finalUrl, {
           timeout: this.DOWNLOAD_TIMEOUT_MS || 0,
           httpAgent: new http.Agent({ keepAlive: true }),
@@ -1005,6 +1045,7 @@ export class RecordingsService {
     const useWebhookToken = Boolean(webhookDownloadToken);
     let oauthToken: string | undefined;
     if (!useWebhookToken) {
+      await this.zoomService.ensureFreshToken();
       oauthToken = await this.zoomService.getAccessToken();
     }
 
@@ -1056,6 +1097,7 @@ export class RecordingsService {
 
     if (!useWebhookToken && [401, 403].includes(res.status)) {
       // Retry once with refreshed OAuth token (Authorization header)
+      await this.zoomService.ensureFreshToken();
       const refreshed = await this.zoomService.getAccessToken();
       oauthToken = refreshed;
       res = await makeRequest(startByte);
@@ -1230,13 +1272,16 @@ export class RecordingsService {
     const acquire = async () => {
       if (active < max) {
         active += 1;
+        this.logger.log(`upload-semaphore:acquire active=${active}/${max}`);
         return;
       }
       await new Promise<void>((resolve) => queue.push(resolve));
       active += 1;
+      this.logger.log(`upload-semaphore:acquire active=${active}/${max}`);
     };
     const release = () => {
       active = Math.max(0, active - 1);
+      this.logger.log(`upload-semaphore:release active=${active}/${max}`);
       const next = queue.shift();
       if (next) next();
     };

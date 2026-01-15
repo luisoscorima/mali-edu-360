@@ -7,9 +7,14 @@ export class ZoomService {
   private readonly logger = new Logger(ZoomService.name);
   private zoomBaseUrl = 'https://api.zoom.us/v2';
   private accessToken: string | null = null;
+  private accessTokenExpiresAt: number | null = null;
+
+  private isTokenValid(): boolean {
+    return Boolean(this.accessToken && this.accessTokenExpiresAt && Date.now() < this.accessTokenExpiresAt);
+  }
 
   private async generateAccessToken(): Promise<string> {
-    if (this.accessToken) return this.accessToken;
+    if (this.isTokenValid()) return this.accessToken!;
 
     const accountId = process.env.ZOOM_ACCOUNT_ID;
     const clientId = process.env.ZOOM_CLIENT_ID;
@@ -30,10 +35,14 @@ export class ZoomService {
     );
 
     this.accessToken = data.access_token;
+    const expiresInSec = Number(data?.expires_in) || 3600;
+    const safetyWindowMs = 60 * 1000;
+    this.accessTokenExpiresAt = Date.now() + Math.max(0, expiresInSec * 1000 - safetyWindowMs);
 
     // Opcional: setTimeout para invalidar después de 1 hora
     setTimeout(() => {
       this.accessToken = null;
+      this.accessTokenExpiresAt = null;
     }, 3500 * 1000);
 
     if (!this.accessToken) {
@@ -41,6 +50,12 @@ export class ZoomService {
     }
 
     return this.accessToken;
+  }
+
+  async ensureFreshToken(): Promise<void> {
+    if (!this.isTokenValid()) {
+      await this.generateAccessToken();
+    }
   }
 
   // Exponer token para integraciones internas (descarga de grabaciones)
