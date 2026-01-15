@@ -76,6 +76,7 @@ export class RecordingsService {
   private readonly DOWNLOAD_TIMEOUT_MS = this.getIntEnv('DOWNLOAD_TIMEOUT_MS', 0); // 0 = no limit
   private readonly DRIVE_UPLOAD_TIMEOUT_MS = this.getIntEnv('DRIVE_UPLOAD_TIMEOUT_MS', 0);
   private readonly MIN_EXPECTED_SIZE_MB = this.getIntEnv('MIN_EXPECTED_SIZE_MB', 1);
+  private readonly MIN_DURATION_SECONDS = this.getIntEnv('MIN_DURATION_SECONDS', 600);
   // Espera antes de publicar en Moodle para dar tiempo al preview de Drive (ms)
   private readonly PREPUBLISH_DELAY_MS = this.getIntEnv('PREPUBLISH_DELAY_MS', 30000);
   // Tiempo máximo de espera para que Drive procese el video (ms) - default 10 minutos
@@ -111,9 +112,9 @@ export class RecordingsService {
     }
 
     // Prevent concurrent processing for the same meeting (Zoom can send duplicates)
-    if (this.inFlightMeetings.has(zoomMeetingId)) {
-      this.logger.warn(`Otro proceso ya está manejando meetingId=${zoomMeetingId}. Se ignora este evento (in-flight).`);
-      return { status: 'in-flight' };
+    while (this.inFlightMeetings.has(zoomMeetingId)) {
+      this.logger.warn(`meetingId=${zoomMeetingId} ya en proceso. Esperando turno para reprocesar grabaciones faltantes...`);
+      await this.sleep(2000);
     }
     this.inFlightMeetings.add(zoomMeetingId);
     this.logger.log(`inflight:acquire meetingId=${zoomMeetingId} active=${this.inFlightMeetings.size}/unbounded`);
@@ -134,172 +135,186 @@ export class RecordingsService {
         this.logger.log(`Meeting encontrado: id=${meeting.id}, courseIdMoodle=${meeting.courseIdMoodle}`);
       }
 
-      // Seleccionar el archivo MP4 preferentemente con estado "completed"; fallback a cualquier MP4 con URL
-      const mp4 =
-        files.find((f: any) => f.file_type === 'MP4' && f.download_url && (f.status === 'completed' || f.recording_status === 'completed')) ||
-        files.find((f: any) => f.file_type === 'MP4' && f.download_url);
-      if (!mp4) {
-        this.logger.warn('No hay archivo MP4 en la grabación');
+      const validMp4s = files
+        .filter((f: any) => f.file_type === 'MP4' && f.download_url)
+        .filter((f: any) => f.status === 'completed' || f.recording_status === 'completed')
+        .filter((f: any) => this.getDurationSeconds(f) >= this.MIN_DURATION_SECONDS);
+
+      if (validMp4s.length === 0) {
+        this.logger.warn('No hay archivos MP4 válidos (completed, duración >= 600s) en la grabación');
         return { status: 'ignored' };
       }
 
-      const zoomRecordingId: string = String(mp4.id || mp4.file_id || mp4.recording_start || 'unknown');
-      const expectedBytes: number | undefined = typeof mp4.file_size === 'number' ? mp4.file_size : undefined;
-
-      // Idempotency: if already processed locally or in Drive, exit gracefully
-      const existing = await this.recRepo.findOne({ where: { zoomRecordingId } });
-      if (existing) {
-        this.logger.log(`Idempotente: recording ya procesada (DB) zoomRecordingId=${zoomRecordingId}.`);
-        await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
-        await this.zoomLicenses.releaseLicense(meeting!.id);
-        return { status: 'done', driveUrl: existing.driveUrl };
-      }
-      const existingDrive = await this.driveService.findFileByZoomRecordingId(zoomRecordingId);
-      if (existingDrive) {
-        this.logger.log(`Idempotente: archivo ya en Drive por zoomRecordingId=${zoomRecordingId}. Creando registro en DB y cerrando flujo.`);
-        const rec = this.recRepo.create({ meetingId: meeting!.id, zoomRecordingId, driveUrl: existingDrive.webViewLink });
-        await this.recRepo.save(rec);
-        await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
-        await this.zoomLicenses.releaseLicense(meeting!.id);
-        return { status: 'done', driveUrl: existingDrive.webViewLink };
-      }
-
-      // 1) Preparar filepath único y serializar operaciones sobre el mismo archivo
-      const timestamp = this.getLocalTimestamp();
       const sanitizedTopic = (topic || 'Clase').replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 50);
-      const filename = `${sanitizedTopic}_${timestamp}_${zoomRecordingId}.mp4`;
-      const localPath = path.join(this.DOWNLOADS_DIR, filename);
+      const ordered = [...validMp4s].sort((a, b) => {
+        const startA = new Date(a.recording_start || 0).getTime();
+        const startB = new Date(b.recording_start || 0).getTime();
+        if (startA !== startB) return startA - startB;
+        return this.getDurationSeconds(b) - this.getDurationSeconds(a);
+      });
 
-      return await this.withFileLock(localPath, async () => {
-        await this.ensureDownloadDir();
-        this.logger.log(`Descargando grabación desde Zoom a: ${localPath}`);
+      let processedCount = 0;
+      let handledCount = 0;
+      for (const mp4 of ordered) {
+        const zoomRecordingId: string = String(mp4.id || mp4.file_id || mp4.recording_start || 'unknown');
+        const expectedBytes: number | undefined = typeof mp4.file_size === 'number' ? mp4.file_size : undefined;
+        const durationSec = this.getDurationSeconds(mp4);
 
-        const dlStartedAt = Date.now();
-        await this.withRobustRetries('download', async (attempt) => {
-          const tokenForThisAttempt = attempt === 1 ? downloadToken : undefined;
-
-          if (!tokenForThisAttempt) {
-            await this.zoomService.ensureFreshToken();
-          }
-
-          const headInfo = await this.warmupHead(mp4.download_url, tokenForThisAttempt);
-          const minBytes = this.MIN_EXPECTED_SIZE_MB * 1024 * 1024;
-          if (headInfo?.contentLength && headInfo.contentLength < minBytes) {
-            throw new RetryableError('Recording not ready yet (size too small) – waiting for Zoom processing');
-          }
-          if (headInfo && headInfo.contentLength && expectedBytes && Math.abs(headInfo.contentLength - expectedBytes) / expectedBytes > 0.01) {
-            this.logger.warn(`HEAD size difiere de payload: head=${headInfo.contentLength} payload=${expectedBytes}`);
-          }
-
-          const info = await this.downloadZoomRecording(mp4.download_url, localPath, tokenForThisAttempt, expectedBytes);
-          const ok = await this.validateDownloadedFile(localPath, expectedBytes, info.contentType);
-          if (!ok) {
-            try { fs.unlinkSync(localPath); } catch { }
-            throw new Error('Archivo descargado inválido o incompleto');
-          }
-        });
-        const dlMs = Date.now() - dlStartedAt;
-        const { size: finalDownloadSize } = fs.statSync(localPath);
-        this.logger.log(`Descarga completa (${finalDownloadSize} bytes) en ${Math.round(dlMs / 1000)}s.`);
-
-        // 2) Upload to Drive into course folder + yyyy-mm
-        const courseFolderCode = String(meeting!.courseIdMoodle);
-        const courseFolderId = await this.ensureCourseFolder(meeting!.courseIdMoodle!);
-        this.logger.log(`Carpeta curso en Drive: ${courseFolderCode} -> ${courseFolderId}`);
-        const monthFolderId = await this.driveService.ensureFolder(new Date().toISOString().slice(0, 7), courseFolderId);
-        const upStartedAt = Date.now();
-        const upload = await this.withRobustRetries('upload', async (attempt) => {
-          const res = await this.uploadSemaphore.run(() => this.driveService.uploadFile(localPath, filename, monthFolderId, {
-            meetingId: meeting!.id,
-            courseIdMoodle: meeting!.courseIdMoodle!,
-            zoomRecordingId,
-            timeoutMs: this.DRIVE_UPLOAD_TIMEOUT_MS,
-          }));
-          const localMd5 = await this.md5File(localPath);
-          if (res.md5Checksum && res.md5Checksum !== localMd5) {
-            this.logger.warn(`MD5 mismatch: drive=${res.md5Checksum} local=${localMd5}`);
-            throw new Error('MD5 checksum mismatch after upload');
-          }
-          if (!res.md5Checksum) {
-            throw new Error('Drive no devolvió md5Checksum (posible carga incompleta)');
-          }
-          if (res.sizeBytes && Math.abs(res.sizeBytes - finalDownloadSize) > 1024) {
-            throw new Error(`Tamaño en Drive (${res.sizeBytes}) difiere del local (${finalDownloadSize})`);
-          }
-          return { ...res, localMd5 };
-        });
-        const driveLink = upload.webViewLink;
-        const upMs = Date.now() - upStartedAt;
-        this.logger.log(`upload:done meetingId=${meeting!.id} recordingId=${zoomRecordingId} fileId=${upload.fileId} md5=${upload.md5Checksum || upload.localMd5} size=${finalDownloadSize} duration=${Math.round(upMs / 1000)}s`);
+        this.logger.log(`recording:processing-start zoomRecordingId=${zoomRecordingId} durationSec=${durationSec}`);
 
         try {
-          const post = await this.driveService.verifyPostUpload(
-            upload.fileId,
-            upload.localMd5,
-            finalDownloadSize,
-          );
-          this.logger.log(
-            `drive:post-upload-status fileId=${upload.fileId} exists=${post.exists} md5=${post.md5Validated} size=${post.sizeValidated} processed=${post.processed} thumbnail=${post.hasThumbnail}`,
-          );
-        } catch (e: any) {
-          this.logger.warn(`drive:post-upload-check-failed fileId=${upload.fileId} err=${e?.message || e}`);
-        }
-
-        // Toque pasivo para que Drive comience a procesar el video
-        await this.driveService.touchPreview(upload.fileId);
-
-        // Esperar a que el video esté procesado (con timeout configurable)
-        let lastLoggedMinute = -1;
-        const videoReady = await this.driveService.waitForVideoReady(
-          upload.fileId,
-          this.DRIVE_PROCESSING_TIMEOUT_MS,
-          (status) => {
-            const minute = Math.floor(status.elapsed / 60000);
-            if (minute !== lastLoggedMinute) {
-              lastLoggedMinute = minute;
-              this.logger.log(`drive:processing-wait fileId=${upload.fileId} elapsed=${Math.round(status.elapsed / 1000)}s processed=${status.processed} thumbnail=${status.hasThumbnail}`);
-            }
+          const existing = await this.recRepo.findOne({ where: { zoomRecordingId } });
+          if (existing) {
+            this.logger.log(`Idempotente: recording ya procesada (DB) zoomRecordingId=${zoomRecordingId}.`);
+            handledCount += 1;
+            continue;
           }
-        );
+          const existingDrive = await this.driveService.findFileByZoomRecordingId(zoomRecordingId);
+          if (existingDrive) {
+            this.logger.log(`Idempotente: archivo ya en Drive por zoomRecordingId=${zoomRecordingId}. Creando registro en DB.`);
+            const rec = this.recRepo.create({ meetingId: meeting!.id, zoomRecordingId, driveUrl: existingDrive.webViewLink });
+            await this.recRepo.save(rec);
+            handledCount += 1;
+            continue;
+          }
 
-        if (!videoReady) {
-          this.logger.warn(`drive:video-not-ready-yet fileId=${upload.fileId} - publicando de todas formas (se procesará eventualmente)`);
+          const timestamp = this.getLocalTimestamp();
+          const filename = `${sanitizedTopic}_${timestamp}_${zoomRecordingId}.mp4`;
+          const localPath = path.join(this.DOWNLOADS_DIR, filename);
+
+          await this.withFileLock(localPath, async () => {
+            await this.ensureDownloadDir();
+            this.logger.log(`Descargando grabación desde Zoom a: ${localPath}`);
+
+            const dlStartedAt = Date.now();
+            await this.withRobustRetries('download', async (attempt) => {
+              const tokenForThisAttempt = attempt === 1 ? downloadToken : undefined;
+
+              if (!tokenForThisAttempt) {
+                await this.zoomService.ensureFreshToken();
+              }
+
+              const headInfo = await this.warmupHead(mp4.download_url, tokenForThisAttempt);
+              const minBytes = this.MIN_EXPECTED_SIZE_MB * 1024 * 1024;
+              if (headInfo?.contentLength && headInfo.contentLength < minBytes) {
+                throw new RetryableError('Recording not ready yet (size too small) – waiting for Zoom processing');
+              }
+              if (headInfo && headInfo.contentLength && expectedBytes && Math.abs(headInfo.contentLength - expectedBytes) / expectedBytes > 0.01) {
+                this.logger.warn(`HEAD size difiere de payload: head=${headInfo.contentLength} payload=${expectedBytes}`);
+              }
+
+              const info = await this.downloadZoomRecording(mp4.download_url, localPath, tokenForThisAttempt, expectedBytes);
+              const ok = await this.validateDownloadedFile(localPath, expectedBytes, info.contentType);
+              if (!ok) {
+                try { fs.unlinkSync(localPath); } catch { }
+                throw new Error('Archivo descargado inválido o incompleto');
+              }
+            });
+            const dlMs = Date.now() - dlStartedAt;
+            const { size: finalDownloadSize } = fs.statSync(localPath);
+            this.logger.log(`Descarga completa (${finalDownloadSize} bytes) en ${Math.round(dlMs / 1000)}s.`);
+
+            const courseFolderCode = String(meeting!.courseIdMoodle);
+            const courseFolderId = await this.ensureCourseFolder(meeting!.courseIdMoodle!);
+            this.logger.log(`Carpeta curso en Drive: ${courseFolderCode} -> ${courseFolderId}`);
+            const monthFolderId = await this.driveService.ensureFolder(new Date().toISOString().slice(0, 7), courseFolderId);
+            const upStartedAt = Date.now();
+            const upload = await this.withRobustRetries('upload', async () => {
+              const res = await this.uploadSemaphore.run(() => this.driveService.uploadFile(localPath, filename, monthFolderId, {
+                meetingId: meeting!.id,
+                courseIdMoodle: meeting!.courseIdMoodle!,
+                zoomRecordingId,
+                timeoutMs: this.DRIVE_UPLOAD_TIMEOUT_MS,
+              }));
+              const localMd5 = await this.md5File(localPath);
+              if (res.md5Checksum && res.md5Checksum !== localMd5) {
+                this.logger.warn(`MD5 mismatch: drive=${res.md5Checksum} local=${localMd5}`);
+                throw new Error('MD5 checksum mismatch after upload');
+              }
+              if (!res.md5Checksum) {
+                throw new Error('Drive no devolvió md5Checksum (posible carga incompleta)');
+              }
+              if (res.sizeBytes && Math.abs(res.sizeBytes - finalDownloadSize) > 1024) {
+                throw new Error(`Tamaño en Drive (${res.sizeBytes}) difiere del local (${finalDownloadSize})`);
+              }
+              return { ...res, localMd5 };
+            });
+            const driveLink = upload.webViewLink;
+            const upMs = Date.now() - upStartedAt;
+            this.logger.log(`upload:done meetingId=${meeting!.id} recordingId=${zoomRecordingId} fileId=${upload.fileId} md5=${upload.md5Checksum || upload.localMd5} size=${finalDownloadSize} duration=${Math.round(upMs / 1000)}s`);
+
+            try {
+              const post = await this.driveService.verifyPostUpload(
+                upload.fileId,
+                upload.localMd5,
+                finalDownloadSize,
+              );
+              this.logger.log(
+                `drive:post-upload-status fileId=${upload.fileId} exists=${post.exists} md5=${post.md5Validated} size=${post.sizeValidated} processed=${post.processed} thumbnail=${post.hasThumbnail}`,
+              );
+            } catch (e: any) {
+              this.logger.warn(`drive:post-upload-check-failed fileId=${upload.fileId} err=${e?.message || e}`);
+            }
+
+            await this.driveService.touchPreview(upload.fileId);
+
+            let lastLoggedMinute = -1;
+            const videoReady = await this.driveService.waitForVideoReady(
+              upload.fileId,
+              this.DRIVE_PROCESSING_TIMEOUT_MS,
+              (status) => {
+                const minute = Math.floor(status.elapsed / 60000);
+                if (minute !== lastLoggedMinute) {
+                  lastLoggedMinute = minute;
+                  this.logger.log(`drive:processing-wait fileId=${upload.fileId} elapsed=${Math.round(status.elapsed / 1000)}s processed=${status.processed} thumbnail=${status.hasThumbnail}`);
+                }
+              }
+            );
+
+            if (!videoReady) {
+              this.logger.warn(`drive:video-not-ready-yet fileId=${upload.fileId} - publicando de todas formas (se procesará eventualmente)`);
+            }
+
+            if (this.PREPUBLISH_DELAY_MS > 0) {
+              this.logger.log(`Esperando ${Math.round(this.PREPUBLISH_DELAY_MS / 1000)}s adicionales antes de publicar en Moodle…`);
+              await this.sleep(this.PREPUBLISH_DELAY_MS);
+            }
+
+            const forumId = await this.moodleService.getRecordedForumId(meeting!.courseIdMoodle!);
+            this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting!.courseIdMoodle}`);
+            const previewLink = driveLink.replace('/view', '/preview');
+            const iframe = `<div style="max-width: 720px; width: 80vw; margin: 20px auto;"><div style="position: relative; width: 100%; padding-top: 56.25%;"><iframe style="position: absolute; inset: 0; width: 100%; height: 100%; border: 0;" src="${previewLink}" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe><div style="position: absolute; top: 8px; right: 8px; width: 72px; height: 72px; z-index: 3; background: transparent; cursor: not-allowed;" title="Pop-out deshabilitado" aria-label="Pop-out deshabilitado"></div></div></div>`;
+            const downloadDate = new Date().toISOString().slice(0, 10);
+            const subject = `${topic || 'Clase grabada'} | ${downloadDate} [${zoomRecordingId}]`;
+            await this.withRobustRetries('upload', async () => {
+              await this.moodleService.addForumDiscussion(forumId, subject, iframe);
+            });
+
+            const rec = this.recRepo.create({
+              meetingId: meeting!.id,
+              zoomRecordingId,
+              driveUrl: driveLink,
+            });
+            await this.recRepo.save(rec);
+
+            try { fs.unlinkSync(localPath); } catch { }
+
+            this.logger.log(`Pipeline OK | tiempo total: descarga ${Math.round(dlMs / 1000)}s + subida ${Math.round(upMs / 1000)}s`);
+            this.logger.log(`Grabación procesada y publicada: ${previewLink}`);
+            processedCount += 1;
+            handledCount += 1;
+          });
+        } catch (e: any) {
+          this.logger.error(`recording:processing-failed zoomRecordingId=${zoomRecordingId} err=${e?.message || e}`);
         }
+      }
 
-        // Espera adicional configurable
-        if (this.PREPUBLISH_DELAY_MS > 0) {
-          this.logger.log(`Esperando ${Math.round(this.PREPUBLISH_DELAY_MS / 1000)}s adicionales antes de publicar en Moodle…`);
-          await this.sleep(this.PREPUBLISH_DELAY_MS);
-        }
-
-        const forumId = await this.moodleService.getRecordedForumId(meeting!.courseIdMoodle!);
-        this.logger.log(`Publicando en foro Moodle ${forumId} del curso ${meeting!.courseIdMoodle}`);
-        const previewLink = driveLink.replace('/view', '/preview');
-        const iframe = `<div style="max-width: 720px; width: 80vw; margin: 20px auto;"><div style="position: relative; width: 100%; padding-top: 56.25%;"><iframe style="position: absolute; inset: 0; width: 100%; height: 100%; border: 0;" src="${previewLink}" allow="autoplay; encrypted-media" allowfullscreen="allowfullscreen"></iframe><div style="position: absolute; top: 8px; right: 8px; width: 72px; height: 72px; z-index: 3; background: transparent; cursor: not-allowed;" title="Pop-out deshabilitado" aria-label="Pop-out deshabilitado"></div></div></div>`;
-        const downloadDate = new Date().toISOString().slice(0, 10);
-        const subject = `${topic || 'Clase grabada'} | ${downloadDate} [${zoomRecordingId}]`;
-        await this.withRobustRetries('upload', async () => {
-          await this.moodleService.addForumDiscussion(forumId, subject, iframe);
-        });
-
-        // 4) Persist Recording
-        const rec = this.recRepo.create({
-          meetingId: meeting!.id,
-          zoomRecordingId,
-          driveUrl: driveLink,
-        });
-        await this.recRepo.save(rec);
-
-        // 5) Update meeting and release license
+      if (handledCount > 0) {
         await this.meetingRepo.update(meeting!.id, { status: 'completed' as any });
-        await this.zoomLicenses.releaseLicense(meeting!.id);
+      }
+      await this.zoomLicenses.releaseLicense(meeting!.id);
 
-        try { fs.unlinkSync(localPath); } catch { }
-
-        this.logger.log(`Pipeline OK | tiempo total: descarga ${Math.round(dlMs / 1000)}s + subida ${Math.round(upMs / 1000)}s`);
-        this.logger.log(`Grabación procesada y publicada: ${previewLink}`);
-        return { status: 'done', driveUrl: driveLink };
-      });
+      return { status: processedCount > 0 ? 'done' : 'skipped', processed: processedCount, total: ordered.length };
     } finally {
       if (zoomMeetingId) {
         this.inFlightMeetings.delete(zoomMeetingId);
@@ -1208,6 +1223,11 @@ export class RecordingsService {
     const exp = Math.min(max, base * Math.pow(2, attempt));
     const jitter = Math.floor(Math.random() * Math.floor(exp * 0.2)); // +/-20%
     return Math.min(max, exp + jitter);
+  }
+
+  private getDurationSeconds(file: any): number {
+    const duration = Number(file?.duration);
+    return Number.isFinite(duration) ? duration : 0;
   }
 
   private sleep(ms: number) {
