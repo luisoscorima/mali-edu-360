@@ -1,5 +1,4 @@
 // src/drive/drive.service.ts
-
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { google, drive_v3 } from 'googleapis';
 import * as path from 'path';
@@ -259,6 +258,25 @@ export class DriveService implements OnModuleInit {
       this.logger.log(`drive:preview-touched fileId=${fileId}`);
     } catch {
       // Ignorar: solo es un toque pasivo, no debe bloquear
+    }
+  }
+
+  /** HEAD liviano para intentar despertar el preview sin bloquear. */
+  async wakeUpVideoPreview(fileId: string): Promise<void> {
+    const url = `https://drive.google.com/file/d/${fileId}/preview`;
+    try {
+      const res = await axios.head(url, {
+        timeout: 8000,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        validateStatus: () => true,
+      });
+      if (res.status >= 200 && res.status < 400) {
+        this.logger.log(`drive:wakeup:success fileId=${fileId} status=${res.status}`);
+      } else {
+        this.logger.warn(`drive:wakeup:warn fileId=${fileId} status=${res.status}`);
+      }
+    } catch (e) {
+      this.logger.warn(`drive:wakeup:error fileId=${fileId} err=${(e as any)?.message || e}`);
     }
   }
 

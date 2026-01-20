@@ -1,4 +1,6 @@
+//src/app.module.ts
 import { Module } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { MeetingsModule } from './meetings/meetings.module';
@@ -7,6 +9,7 @@ import { RecordingsModule } from './recordings/recordings.module';
 import { DriveModule } from './drive/drive.module';
 import { MoodleModule } from './moodle/moodle.module';
 import { AdminModule } from './admin/admin.module';
+import { SchedulerModule } from './scheduler/scheduler.module';
 
 @Module({
   imports: [
@@ -41,6 +44,8 @@ import { AdminModule } from './admin/admin.module';
     DriveModule,
     MoodleModule,
     AdminModule,
+    ScheduleModule.forRoot(),
+    SchedulerModule,
   ],
 })
 export class AppModule { }

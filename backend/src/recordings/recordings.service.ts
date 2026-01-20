@@ -1,3 +1,4 @@
+// src/recordings/recordings.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosResponse } from 'axios';
@@ -250,30 +251,13 @@ export class RecordingsService {
                 finalDownloadSize,
               );
               this.logger.log(
-                `drive:post-upload-status fileId=${upload.fileId} exists=${post.exists} md5=${post.md5Validated} size=${post.sizeValidated} processed=${post.processed} thumbnail=${post.hasThumbnail}`,
+                `drive:post-upload-status fileId=${upload.fileId} md5=${post.md5Validated} size=${post.sizeValidated}`,
               );
             } catch (e: any) {
               this.logger.warn(`drive:post-upload-check-failed fileId=${upload.fileId} err=${e?.message || e}`);
             }
 
             await this.driveService.touchPreview(upload.fileId);
-
-            let lastLoggedMinute = -1;
-            const videoReady = await this.driveService.waitForVideoReady(
-              upload.fileId,
-              this.DRIVE_PROCESSING_TIMEOUT_MS,
-              (status) => {
-                const minute = Math.floor(status.elapsed / 60000);
-                if (minute !== lastLoggedMinute) {
-                  lastLoggedMinute = minute;
-                  this.logger.log(`drive:processing-wait fileId=${upload.fileId} elapsed=${Math.round(status.elapsed / 1000)}s processed=${status.processed} thumbnail=${status.hasThumbnail}`);
-                }
-              }
-            );
-
-            if (!videoReady) {
-              this.logger.warn(`drive:video-not-ready-yet fileId=${upload.fileId} - publicando de todas formas (se procesará eventualmente)`);
-            }
 
             if (this.PREPUBLISH_DELAY_MS > 0) {
               this.logger.log(`Esperando ${Math.round(this.PREPUBLISH_DELAY_MS / 1000)}s adicionales antes de publicar en Moodle…`);
@@ -864,7 +848,7 @@ export class RecordingsService {
             localStat.size,
           );
           this.logger.log(
-            `drive:post-upload-status fileId=${uploadResult.fileId} exists=${post.exists} md5=${post.md5Validated} size=${post.sizeValidated} processed=${post.processed} thumbnail=${post.hasThumbnail}`,
+            `drive:post-upload-status fileId=${uploadResult.fileId} md5=${post.md5Validated} size=${post.sizeValidated}`,
           );
         } catch (e: any) {
           this.logger.warn(`drive:post-upload-check-failed fileId=${uploadResult.fileId} err=${e?.message || e}`);
@@ -872,24 +856,6 @@ export class RecordingsService {
 
         // Toque pasivo para que Drive comience a procesar el video
         await this.driveService.touchPreview(uploadResult.fileId);
-
-        // Esperar a que el video esté procesado
-        let lastLoggedMinute = -1;
-        const videoReady = await this.driveService.waitForVideoReady(
-          uploadResult.fileId,
-          this.DRIVE_PROCESSING_TIMEOUT_MS,
-          (status) => {
-            const minute = Math.floor(status.elapsed / 60000);
-            if (minute !== lastLoggedMinute) {
-              lastLoggedMinute = minute;
-              this.logger.log(`drive:processing-wait fileId=${uploadResult.fileId} elapsed=${Math.round(status.elapsed / 1000)}s processed=${status.processed} thumbnail=${status.hasThumbnail}`);
-            }
-          }
-        );
-
-        if (!videoReady) {
-          this.logger.warn(`drive:video-not-ready-yet fileId=${uploadResult.fileId} - publicando de todas formas`);
-        }
 
         this.logger.log(`upload:done meetingId=${meeting.id} recordingId=${mp4File.id} fileId=${uploadResult.fileId} md5=${uploadResult.md5Checksum}`);
 
