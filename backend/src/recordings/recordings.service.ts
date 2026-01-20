@@ -78,9 +78,9 @@ export class RecordingsService {
   private readonly MIN_EXPECTED_SIZE_MB = this.getIntEnv('MIN_EXPECTED_SIZE_MB', 1);
   private readonly MIN_DURATION_SECONDS = this.getIntEnv('MIN_DURATION_SECONDS', 600);
   // Espera antes de publicar en Moodle para dar tiempo al preview de Drive (ms)
-  private readonly PREPUBLISH_DELAY_MS = this.getIntEnv('PREPUBLISH_DELAY_MS', 30000);
-  // Tiempo máximo de espera para que Drive procese el video (ms) - default 10 minutos
-  private readonly DRIVE_PROCESSING_TIMEOUT_MS = this.getIntEnv('DRIVE_PROCESSING_TIMEOUT_MS', 600000);
+  private readonly PREPUBLISH_DELAY_MS = this.getIntEnv('PREPUBLISH_DELAY_MS', 60000);
+  // Tiempo máximo de espera para que Drive procese el video (ms) - default 5 minutos
+  private readonly DRIVE_PROCESSING_TIMEOUT_MS = this.getIntEnv('DRIVE_PROCESSING_TIMEOUT_MS', 300000);
 
   constructor(
     @InjectRepository(Recording)
