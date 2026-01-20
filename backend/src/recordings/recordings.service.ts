@@ -1227,7 +1227,15 @@ export class RecordingsService {
 
   private getDurationSeconds(file: any): number {
     const duration = Number(file?.duration);
-    return Number.isFinite(duration) ? duration : 0;
+    if (Number.isFinite(duration) && duration > 0) return duration;
+
+    const start = file?.recording_start ? new Date(file.recording_start).getTime() : NaN;
+    const end = file?.recording_end ? new Date(file.recording_end).getTime() : NaN;
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      return Math.round((end - start) / 1000);
+    }
+
+    return 0;
   }
 
   private sleep(ms: number) {
