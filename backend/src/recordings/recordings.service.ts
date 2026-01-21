@@ -785,6 +785,53 @@ export class RecordingsService {
         throw new Error('MP4 file not found in Zoom recording');
       }
 
+      // Idempotencia: si ya existe en DB o Drive y no se fuerza la descarga, salir o sólo republicar
+      const mp4Id = String(mp4File.id);
+      const existingRec = await this.recRepo.findOne({ where: { zoomRecordingId: mp4Id } });
+      if (existingRec && existingRec.driveUrl && !dto.forceRedownload) {
+        target.recording = existingRec;
+        if (dto.republish || dto.forceRepost) {
+          return await this.executeRepublishMode(target, courseIdMoodle, dto, selector);
+        }
+        return {
+          selector,
+          mode: 'full',
+          status: 'skipped',
+          reason: 'already-uploaded',
+          courseIdMoodle,
+          ...this.extractTargetMetadata({ ...target, recording: existingRec }),
+        };
+      }
+
+      if (!dto.forceRedownload) {
+        const existingDrive = await this.driveService.findFileByZoomRecordingId(mp4Id);
+        if (existingDrive) {
+          if (!existingRec && meeting?.id) {
+            const rec = this.recRepo.create({
+              meetingId: meeting.id,
+              zoomRecordingId: mp4Id,
+              driveUrl: existingDrive.webViewLink,
+            });
+            target.recording = await this.recRepo.save(rec);
+          } else if (existingRec) {
+            target.recording = existingRec;
+          }
+
+          if (dto.republish || dto.forceRepost) {
+            return await this.executeRepublishMode(target, courseIdMoodle, dto, selector);
+          }
+
+          return {
+            selector,
+            mode: 'full',
+            status: 'skipped',
+            reason: 'already-uploaded-drive',
+            courseIdMoodle,
+            ...this.extractTargetMetadata({ ...target, recording: target.recording }),
+          };
+        }
+      }
+
       const filename = `${zoomMeetingId}_${mp4File.id}.mp4`;
       const downloadPath = path.join(this.DOWNLOADS_DIR, filename);
 
