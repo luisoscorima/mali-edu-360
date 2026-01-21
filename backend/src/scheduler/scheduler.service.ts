@@ -24,6 +24,7 @@ export class SchedulerService {
 		todayLocal.setHours(0, 0, 0, 0);
 		const yesterdayLocal = new Date(todayLocal);
 		yesterdayLocal.setDate(yesterdayLocal.getDate() - 1);
+		const cutoff = new Date(now.getTime() - 90 * 60 * 1000);
 
 		this.logger.log(`[DriveWakeupJob] start range=${yesterdayLocal.toISOString()}..${todayLocal.toISOString()}`);
 
@@ -32,6 +33,8 @@ export class SchedulerService {
 			recs = await this.recRepo.createQueryBuilder('r')
 				.where('r.createdAt >= :from AND r.createdAt < :to', { from: yesterdayLocal, to: todayLocal })
 				.andWhere('r.driveUrl IS NOT NULL')
+				.andWhere('r.driveWakeupAttempts < :maxAttempts', { maxAttempts: 2 })
+				.andWhere('(r.lastDriveWakeupAt IS NULL OR r.lastDriveWakeupAt <= :cutoff)', { cutoff })
 				.getMany();
 		} catch (e) {
 			this.logger.warn(`[DriveWakeupJob] query-failed err=${(e as any)?.message || e}`);
@@ -44,15 +47,40 @@ export class SchedulerService {
 			const fileId = this.extractFileId(rec.driveUrl);
 			if (!fileId) continue;
 
-			this.logger.log(`[DriveWakeupJob] wakeup recordingId=${rec.id} fileId=${fileId}`);
+			const attemptNumber = rec.driveWakeupAttempts + 1;
+			this.logger.log(
+				`[DriveWakeupJob] wakeup recordingId=${rec.id} fileId=${fileId} attempt=${attemptNumber}/2 lastAt=${rec.lastDriveWakeupAt ? rec.lastDriveWakeupAt.toISOString() : 'none'}`,
+			);
 			try {
+				const metaBefore = await this.driveService.getFileMetadata(fileId);
+				const beforeProcessed = metaBefore.videoMediaMetadata?.processingStatus === 'ready';
+				const beforeThumb = Boolean(metaBefore.thumbnailLink);
+				if (beforeThumb && !beforeProcessed) {
+					this.logger.log(`[DriveWakeupJob] skip fileId=${fileId} reason=thumbnail-present processing=in-progress attempts=${rec.driveWakeupAttempts}/2`);
+					await this.recRepo.update(rec.id, {
+						driveWakeupAttempts: 2,
+						lastDriveWakeupAt: new Date(),
+					});
+					continue;
+				}
+
 				await this.driveService.wakeUpVideoPreview(fileId);
 				const meta = await this.driveService.getFileMetadata(fileId);
 				const processed = meta.videoMediaMetadata?.processingStatus === 'ready';
 				const hasThumb = Boolean(meta.thumbnailLink);
-				this.logger.log(`[DriveWakeupJob] result fileId=${fileId} processed=${processed} thumb=${hasThumb}`);
+				this.logger.log(
+					`[DriveWakeupJob] result fileId=${fileId} processed=${processed} thumb=${hasThumb} attempts=${attemptNumber}`,
+				);
+				await this.recRepo.update(rec.id, {
+					driveWakeupAttempts: attemptNumber,
+					lastDriveWakeupAt: new Date(),
+				});
 			} catch (e) {
 				this.logger.warn(`[DriveWakeupJob] error fileId=${fileId} err=${(e as any)?.message || e}`);
+				await this.recRepo.update(rec.id, {
+					driveWakeupAttempts: attemptNumber,
+					lastDriveWakeupAt: new Date(),
+				});
 			}
 		}
 

@@ -25,4 +25,10 @@ export class Recording {
 
   @Column({ type: 'int', default: 0 })
   retryCount: number;
+
+  @Column({ type: 'int', default: 0 })
+  driveWakeupAttempts: number;
+
+  @Column({ type: 'timestamp', nullable: true })
+  lastDriveWakeupAt?: Date;
 }
